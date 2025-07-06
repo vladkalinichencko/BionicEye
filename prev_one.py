@@ -15,8 +15,7 @@ from einops import rearrange
 import wandb
 
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 CFG = {
@@ -110,7 +109,7 @@ images = torch.tensor(train_imgs, dtype=torch.float32, device=device)
 targets = _ds.train.targets
 logger.info(f"Dataset: images {images.shape}, targets {len(targets)} entries")
 
-# Time Positional 2d + Friquence improved Legendre Memory Helpers
+# Time Positional 2D
 def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
     assert embed_dim % 2 == 0, "embed_dim must be even"
     omega = np.arange(embed_dim // 2, dtype=np.float64) / (embed_dim / 2.0)
@@ -118,7 +117,6 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.nda
     pos = pos.reshape(-1)
     out = np.einsum('m,d->md', pos, omega)
     return np.concatenate([np.sin(out), np.cos(out)], axis=1)
-
 
 def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> np.ndarray:
     assert embed_dim % 2 == 0, "embed_dim must be even"
@@ -129,7 +127,6 @@ def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> np.ndarray:
     emb_h = get_1d_sincos_pos_embed_from_grid(dim_half, grid[0])
     emb_w = get_1d_sincos_pos_embed_from_grid(dim_half, grid[1])
     return np.concatenate([emb_h, emb_w], axis=1)
-
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, T: int) -> torch.Tensor:
     BTF, N, M = x.shape
@@ -147,15 +144,17 @@ class TimestepEmbedder(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size)
         )
+        
     @staticmethod
     def timestep_embedding(t: torch.LongTensor, dim: int, max_period: int = 10000) -> torch.Tensor:
         half = dim // 2
         freqs = torch.exp(-math.log(max_period) * torch.arange(half, dtype=torch.float32, device=t.device) / half)
-        args  = t.unsqueeze(1).float() * freqs.unsqueeze(0)
-        emb   = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        args = t.unsqueeze(1).float() * freqs.unsqueeze(0)
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
             emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
         return emb
+    
     def forward(self, t: torch.LongTensor) -> torch.Tensor:
         pe = self.timestep_embedding(t, self.freq_emb)
         return self.mlp(pe)
@@ -164,7 +163,7 @@ class LabelEmbedder(nn.Module):
     def __init__(self, num_classes: int, hidden_size: int, drop_p: float = 0.0):
         super().__init__()
         self.embed = nn.Embedding(num_classes + int(drop_p > 0), hidden_size)
-        self.p     = drop_p
+        self.p = drop_p
     def forward(self, labels: torch.LongTensor, train: bool, force: torch.LongTensor = None) -> torch.Tensor:
         if (train and self.p > 0) or force is not None:
             if force is None:
@@ -181,7 +180,7 @@ def build_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
     np_pe = get_2d_sincos_pos_embed(embed_dim, grid_size)
     return torch.from_numpy(np_pe).float()
 
-#patch embedding + SinCos PE
+# Patch Embedding + SinCos PE
 class PatchEmbedding(nn.Module):
     def __init__(self, in_ch: int, p_size: int, d_model: int, img_size: int):
         super().__init__()
@@ -243,8 +242,7 @@ class ViTWithTimeAndFiLM(nn.Module):
         )
 
 
-def compute_gae(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor,
-                gamma: float, lam: float):
+def compute_gae(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor, gamma: float, lam: float):
     T, N = rewards.shape
     advantages = torch.zeros((T, N), device=device)
     last_adv = torch.zeros(N, device=device)
