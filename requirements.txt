@@ -1,0 +1,13 @@
+gym
+wandb
+torch
+torchvision
+torchaudio
+einops
+scikit-learn
+numpy
+pandas
+tqdm
+Pillow
+imageio
+imageio-ffmpeg 

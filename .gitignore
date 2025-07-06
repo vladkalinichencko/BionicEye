@@ -1,0 +1,10 @@
+# Environments
+venv/
+*.pyc
+__pycache__/
+
+# Local data and results
+checkpoints/
+visualizations/
+wandb/
+cifar10.npz 
