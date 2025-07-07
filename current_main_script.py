@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 logger = logging.getLogger(__name__)
 
 CFG = {
-    'env_steps': 10_000_000,
+    'env_steps': 1000000,
     'rollout_length': 128,
     'update_epochs': 4,
     'gamma': 0.99,
@@ -32,7 +32,7 @@ CFG = {
     'd_model': 128,
     'n_heads': 4,
     'n_layers': 4,
-    'patch_size': 16,              # retina resolution (output H=W)
+    'patch_size': 8,              # retina resolution (output H=W)
     'step_penalty': 0.1,           # >0 ; env subtracts this each non-terminal step
     'entropy_coef': 0.01,   # PPO entropy bonus
     'intrinsic_coef': 0.05, # coefficient for intrinsic reward (-entropy)
@@ -45,15 +45,16 @@ CFG = {
     'n_move': 4,
     'interp_mode': 'bilinear',     # resize mode: nearest, bilinear, bicubic, area
     'surprise_coef': 0.1,          # Add surprise coefficient
-    'viz_interval': 20000,         # How often to log visualization (in steps)
+    'viz_interval': 200000,         # How often to log visualization (in steps)
+    'grad_clip_norm': 0.5,         # Max norm for gradient clipping
 }
 
 sweep_config = {
     'method': 'bayes',
     'metric': {'name': 'avg_return', 'goal': 'maximize'},
     'parameters': {
-        'lr': {'min': 1e-5, 'max': 1e-4},
-        'entropy_coef': {'min': 1e-2, 'max': 1e-1},
+        'lr': {'min': 1e-5, 'max': 5e-5},
+        'entropy_coef': {'min': 0.05, 'max': 0.2},
         'batch_size': {'values': [128]},
         'update_epochs': {'values': [2, 4]},
         'rollout_length': {'values': [128]},
@@ -63,10 +64,12 @@ sweep_config = {
         'correct_bonus': {'values': [1, 2, 3]},
         'wrong_penalty': {'values': [0]},
         'step_penalty': {'values': [0.0, 0.05, 0.1]},
-        'intrinsic_coef': {'min': 0.0, 'max': 0.1},
-        'surprise_coef': {'min': 0.0, 'max': 0.2}, # Add surprise to sweep
-        'recon_coef': {'min':0.0,'max':0.2},
+        'intrinsic_coef': {'min': 0.05, 'max': 0.2},
+        'surprise_coef': {'min': 0.1, 'max': 0.3},
+        'recon_coef': {'min':0.0,'max':0.1},
         'interp_mode': {'values': ['nearest','bilinear','bicubic','area']},
+        'viz_interval': {'values': [20000]},
+        'grad_clip_norm': {'min': 0.3, 'max': 0.7},
     }
 }
 sweep_id = wandb.sweep(sweep_config, project="cifar_active_sweep")
@@ -161,7 +164,7 @@ class ViT(nn.Module):
         super().__init__()
         self.n_classes = n_classes
         self.patch_emb = PatchEmbedding(in_ch, p_size, d_model, img_size)
-        enc_layer = nn.TransformerEncoderLayer(d_model, n_heads, dim_feedforward=4 * d_model, batch_first=True)
+        enc_layer = nn.TransformerEncoderLayer(d_model, n_heads, dim_feedforward=4 * d_model, batch_first=True, norm_first=True)
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
         # Heads
         self.decision_head = nn.Linear(d_model, 1)
@@ -175,14 +178,16 @@ class ViT(nn.Module):
         tokens = self.patch_emb(x)
         out = self.transformer(tokens)
         cls = out[:, 0]
-        decision_logit = self.decision_head(cls).squeeze(-1)  # (B,)
+        # Clamp logits to avoid extreme values that may overflow after sigmoid
+        decision_logit = torch.clamp(self.decision_head(cls).squeeze(-1), -10.0, 10.0)  # (B,)
         class_logits   = self.class_head(cls)                 # (B,K)
         move_params    = self.move_head(cls)                  # (B,4)
         zoom_params    = self.zoom_head(cls)                  # (B,2)
         value          = self.critic(cls).squeeze(-1)
         recon_pred     = self.decoder(cls)
         # unpack move/zoom params
-        mu_move, log_sigma_move = move_params[:, :2], move_params[:, 2:]
+        mu_move_raw, log_sigma_move = move_params[:, :2], move_params[:, 2:]
+        mu_move = torch.sigmoid(mu_move_raw)  # Force mean to be in [0, 1]
         mu_zoom, log_sigma_zoom = zoom_params[:, :1], zoom_params[:, 1:]
         return {
             'decision_logit': decision_logit,
@@ -200,12 +205,21 @@ class ViT(nn.Module):
 class HybridActionDist:
     """Bernoulli (decision) + Categorical (class) + Gaussians (move, zoom)."""
     def __init__(self, params: dict):
-        self.p = torch.sigmoid(params['decision_logit'])          # (B,)
+        # --- Decision branch ---
+        p_raw = torch.sigmoid(params['decision_logit'].clamp(-10.0, 10.0))
+        if not torch.isfinite(p_raw).all():
+            raise RuntimeError("NaN or Inf detected in decision probability. Check model stability.")
+        self.p = p_raw
         self.bernoulli = torch.distributions.Bernoulli(probs=self.p)
+
+        # --- Classification branch ---
         self.cat = torch.distributions.Categorical(logits=params['class_logits'])
-        sigma_move = torch.exp(params['log_sigma_move'])          # (B,2)
+
+        # --- Move / Zoom Gaussians ---
+        sigma_move = torch.exp(params['log_sigma_move'].clamp(-5, 2))   # σ ≈ [0.007, 7.4]
         self.move_dist = torch.distributions.Normal(params['mu_move'], sigma_move)
-        sigma_zoom = torch.exp(params['log_sigma_zoom'])          # (B,1)
+
+        sigma_zoom = torch.exp(params['log_sigma_zoom'].clamp(-5, 2))
         self.zoom_dist = torch.distributions.Normal(params['mu_zoom'], sigma_zoom)
 
     def sample(self):
@@ -342,7 +356,7 @@ class CIFAREnv(gym.Env):
         self.steps += 1
         reward = 0.0
         done = False
-        info = {}
+        info = {'exploration_move': 0, 'off_center_move': 0}
 
         decision = int(action['decision'])
         if decision == 1:  # classify now
@@ -355,8 +369,16 @@ class CIFAREnv(gym.Env):
             # Log action for visualization
             self.history.append({'decision': 1, 'class': pred_class, 'view_size': self.cur_view_size, 'x': self.x, 'y': self.y})
         else:
+            info['exploration_move'] = 1
             # continue exploring: use move & zoom
-            x_norm, y_norm = action['move']
+            x_norm_raw, y_norm_raw = action['move']
+            x_norm = np.clip(x_norm_raw, 0.0, 1.0)
+            y_norm = np.clip(y_norm_raw, 0.0, 1.0)
+
+            # Add off-center metric
+            is_off_center = x_norm < 0.3 or x_norm > 0.7 or y_norm < 0.3 or y_norm > 0.7
+            info['off_center_move'] = 1 if is_off_center else 0
+
             z_factor = float(action['zoom'])
             z_factor = max(1.0, min(self.z_max, z_factor))
             view_size = int(round(self.img_hw / z_factor))
@@ -364,6 +386,7 @@ class CIFAREnv(gym.Env):
 
             cx = int(round(x_norm * (self.img_hw - 1)))
             cy = int(round(y_norm * (self.img_hw - 1)))
+            # centre the viewport on chosen point while keeping inside image
             x0 = max(0, min(self.img_hw - view_size, cx - view_size // 2))
             y0 = max(0, min(self.img_hw - view_size, cy - view_size // 2))
             self.x, self.y = x0, y0
@@ -400,6 +423,11 @@ def train_ppo(agent):
     next_log = 1000
     next_log_and_checkpoint_step = cfg.viz_interval
 
+    # --- Off-center move tracking ---
+    total_exploration_moves = 0
+    total_off_center_moves = 0
+    # ---
+
     obs_batch, info = envs.reset()
     obs_batch = torch.tensor(obs_batch, device=device)
     pbar = tqdm(total=CFG['env_steps'], desc='Training')
@@ -430,6 +458,12 @@ def train_ppo(agent):
                 'zoom':     act_dict['zoom'].cpu().numpy()
             }
             nxt, ext_rews, term, tru, infos = envs.step(env_actions)
+
+            # Accumulate off-center move stats
+            if '_final_info' in infos and 'exploration_move' in infos:
+                mask = infos['_final_info']
+                total_exploration_moves += np.sum(np.array(infos['exploration_move'])[mask])
+                total_off_center_moves += np.sum(np.array(infos['off_center_move'])[mask])
 
             # Combine rewards
             intrinsic_reward = cfg.surprise_coef * surprise - cfg.intrinsic_coef * uncertainty
@@ -525,6 +559,7 @@ def train_ppo(agent):
                 opt.zero_grad()
                 loss = pl + 0.5 * vl - cfg.entropy_coef * ent + cfg.recon_coef * r_loss
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=wandb.config.grad_clip_norm)
                 opt.step()
 
                 tot_pl += pl.item()
@@ -541,6 +576,7 @@ def train_ppo(agent):
         avg_ent = tot_ent / cnt
         avg_rec = tot_rec / cnt
         accuracy = correct_predictions / (len(obs_f) * cfg.update_epochs)
+        off_center_ratio = total_off_center_moves / total_exploration_moves if total_exploration_moves > 0 else 0
 
         wandb.log({
             "step": step_count,
@@ -548,8 +584,13 @@ def train_ppo(agent):
             "value_loss": avg_vl,
             "entropy": avg_ent,
             "accuracy": accuracy,
-            "recon_loss": avg_rec
+            "recon_loss": avg_rec,
+            "off_center_ratio": off_center_ratio,
         }, step=step_count)
+
+        # Reset counters for the next rollout
+        total_exploration_moves = 0
+        total_off_center_moves = 0
 
         if ep_count >= next_log:
             avg_return = np.mean(ep_rewards[-next_log:])
@@ -626,7 +667,7 @@ def create_episode_visualization(history_data, save_dir="visualizations"):
     save_path = os.path.join(save_dir, f"episode_{timestamp}.gif")
     imageio.mimsave(save_path, frames, duration=0.5)
     
-    return wandb.Video(save_path, fps=2, format="gif")
+    return wandb.Image(save_path, caption=f"Episode at step {timestamp}")
 
 def save_checkpoint(agent, path="checkpoints/latest_checkpoint.pth"):
     """Saves the agent's state dictionary, overwriting the previous one."""
@@ -659,14 +700,22 @@ def visualize_and_checkpoint(agent, infos, step_count):
 
     return False
 
-if __name__ == '__main__':
+# ---------------- Entry point ------------------
+
+def run_sweep():
+    """Create a fresh model for each sweep run and train it."""
     os.makedirs('checkpoints', exist_ok=True)
-    in_ch = _ds.train.image_shape[0]  
-    agent = ViT(in_ch=in_ch,
+    in_ch = _ds.train.image_shape[0]
+    model = ViT(in_ch=in_ch,
                 img_size=CFG['patch_size'],
                 p_size=CFG['patch_size'],
                 d_model=CFG['d_model'],
                 n_layers=CFG['n_layers'],
                 n_heads=CFG['n_heads'],
                 n_classes=_ds.train.n_classes).to(device)
-    wandb.agent(sweep_id, function=lambda: train_ppo(agent), count=20)
+    train_ppo(model)
+
+
+if __name__ == '__main__':
+    # Launch wandb agent; remove count to allow indefinite runs (parallel agents possible)
+    wandb.agent(sweep_id, function=run_sweep)
