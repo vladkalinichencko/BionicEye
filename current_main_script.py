@@ -14,6 +14,8 @@ from einops import rearrange
 import wandb
 from PIL import Image, ImageDraw, ImageFont
 import imageio
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -24,62 +26,119 @@ CFG = {
     'env_steps': 1000000,
     'rollout_length': 128,
     'update_epochs': 4,
-    'gamma': 0.99,
-    'gae_lambda': 0.95,
-    'clip_epsilon': 0.1,  
-    'lr': 1e-5,          
+    'gamma': 0.96,
+    'gae_lambda': 0.84,
+    'clip_epsilon': 0.25,
+    'lr': 0.00004,
     'batch_size': 128,
     'd_model': 128,
     'n_heads': 4,
     'n_layers': 4,
-    'patch_size': 8,              # retina resolution (output H=W)
-    'step_penalty': 0.1,           # >0 ; env subtracts this each non-terminal step
-    'entropy_coef': 0.01,   # PPO entropy bonus
-    'intrinsic_coef': 0.05, # coefficient for intrinsic reward (-entropy)
-    'recon_coef': 0.1,      # weight for reconstruction loss in total loss
+    'patch_size': 8,
+    'step_penalty': 0,
+    'entropy_coef': 0.04,
+    'intrinsic_coef': 0.01,
+    'recon_coef': 0.09,
     'checkpoint_interval': 5_000,
     'eval_interval': 10_000,
     'max_episode_steps': 100,
     'dataset_seed': 80411,
     'n_envs': 16,
     'n_move': 4,
-    'interp_mode': 'bilinear',     # resize mode: nearest, bilinear, bicubic, area
-    'surprise_coef': 0.1,          # Add surprise coefficient
-    'viz_interval': 200000,         # How often to log visualization (in steps)
-    'grad_clip_norm': 0.5,         # Max norm for gradient clipping
+    'interp_mode': 'bicubic',
+    'surprise_coef': 0.20,
+    'viz_interval': 200000,
+    'grad_clip_norm': 0.4,
+    'stagnation_penalty': 0.02,
+    'correct_bonus': 3, # Custom parameter from sweep
+    'wrong_penalty': 0,   # Custom parameter from sweep
+    'exploration_bonus': 0.1,  # Reward for exploration movement
+    'action_penalty': 0.05,  # Penalty for each action to encourage efficiency
 }
 
 sweep_config = {
     'method': 'bayes',
-    'metric': {'name': 'avg_return', 'goal': 'maximize'},
+    'metric': {
+        'name': 'validation/accuracy',
+        'goal': 'maximize'
+    },
     'parameters': {
-        'lr': {'min': 1e-5, 'max': 5e-5},
-        'entropy_coef': {'min': 0.05, 'max': 0.2},
-        'batch_size': {'values': [128]},
-        'update_epochs': {'values': [2, 4]},
-        'rollout_length': {'values': [128]},
-        'clip_epsilon': {'min': 0.1, 'max': 0.3},
-        'gamma': {'min': 0.9, 'max': 0.999},
-        'gae_lambda': {'min': 0.8, 'max': 0.99},
-        'correct_bonus': {'values': [1, 2, 3]},
-        'wrong_penalty': {'values': [0]},
-        'step_penalty': {'values': [0.0, 0.05, 0.1]},
-        'intrinsic_coef': {'min': 0.05, 'max': 0.2},
-        'surprise_coef': {'min': 0.1, 'max': 0.3},
-        'recon_coef': {'min':0.0,'max':0.1},
-        'interp_mode': {'values': ['nearest','bilinear','bicubic','area']},
-        'viz_interval': {'values': [20000]},
-        'grad_clip_norm': {'min': 0.3, 'max': 0.7},
-    }
+        'lr': {
+            'min': 1e-5,
+            'max': 1e-4
+        },
+        'gamma': {
+            'min': 0.9,
+            'max': 0.99
+        },
+        'gae_lambda': {
+            'min': 0.8,
+            'max': 0.98
+        },
+        'entropy_coef': {
+            'min': 0.01,
+            'max': 0.2
+        },
+        'clip_epsilon': {
+            'min': 0.1,
+            'max': 0.3
+        },
+        'update_epochs': {
+            'values': [2, 4, 8]
+        },
+        'batch_size': {
+            'values': [64, 128]
+        },
+        'rollout_length': {
+            'values': [128, 256]
+        },
+        'correct_bonus': {
+            'values': [1, 2, 3]
+        },
+        'wrong_penalty': {
+            'values': [0, -1]
+        },
+        'step_penalty': {
+            'values': [0, 0.05, 0.1]
+        },
+        'viz_interval': {
+            'values': [20000]
+        },
+        'interp_mode': {
+            'values': ['bilinear', 'nearest', 'bicubic']
+        },
+        'intrinsic_coef': {
+            'min': 0.05,
+            'max': 0.2
+        },
+        'surprise_coef': {
+            'min': 0.1,
+            'max': 0.3
+        },
+        'recon_coef': {
+            'min': 0.01,
+            'max': 0.1
+        },
+        'grad_clip_norm': {
+            'min': 0.3,
+            'max': 0.7
+        },
+        'exploration_bonus': {
+            'min': 0.05,
+            'max': 0.2
+        },
+    },
+    'program': 'current_main_script.py'
 }
-sweep_id = wandb.sweep(sweep_config, project="cifar_active_sweep")
 
-from sklearn.datasets import fetch_openml
-from sklearn.model_selection import train_test_split
+# Standard CIFAR10 transforms
+transform = transforms.Compose([
+    transforms.ToTensor(),  # [0, 255] -> [0, 1] and converts to torch.FloatTensor
+])
 
 @dataclass
 class DatasetSplit:
-    images: np.ndarray
+    images: torch.Tensor
     targets: np.ndarray
     image_shape: tuple[int, int, int]
 
@@ -88,36 +147,35 @@ class DatasetSplit:
 
     @property
     def n_classes(self):
-        return len(np.unique(self.targets))
+        return 10  # CIFAR10 has 10 classes
 
-class Dataset:
-    def __init__(self, seed: int, cache_path: str = 'cifar10.npz'):
-        if os.path.exists(cache_path):
-            logger.info(f"Loading CIFAR-10 from local cache `{cache_path}`...")
-            data = np.load(cache_path)
-            X, y = data['X'], data['y']
-        else:
-            logger.info("Downloading CIFAR-10 from OpenML...")
-            X, y = fetch_openml('CIFAR_10', version=1, return_X_y=True, as_frame=False)
-            X = X.astype(np.float32)
-            y = y.astype(int)
-            np.savez(cache_path, X=X, y=y)
-            logger.info(f"Saved CIFAR-10 to local cache `{cache_path}`")
+class CIFAR10Dataset:
+    """Clean wrapper around torchvision CIFAR10."""
+    def __init__(self, root='data'):
+        self.train_ds = datasets.CIFAR10(root=root, train=True, download=True, transform=transform)
+        self.test_ds = datasets.CIFAR10(root=root, train=False, download=True, transform=transform)
+        
+        # Convert to tensors
+        train_images = torch.stack([img for img, _ in self.train_ds])
+        test_images = torch.stack([img for img, _ in self.test_ds])
+        
+        train_targets = np.array([label for _, label in self.train_ds])
+        test_targets = np.array([label for _, label in self.test_ds])
+        
+        # Store as (N, C, H, W) tensors
+        self.train = DatasetSplit(train_images, train_targets, (3, 32, 32))
+        self.test = DatasetSplit(test_images, test_targets, (3, 32, 32))
+        
+        logger.info(f"CIFAR-10 loaded: train {train_images.shape}, test {test_images.shape}")
 
-        X = X / 255.0 
-        shape = (3, 32, 32)  
-        train_X, test_X, train_y, test_y = train_test_split(
-            X, y, test_size=10000, random_state=seed
-        )
-        self.train = DatasetSplit(train_X, train_y, shape)
-        self.test  = DatasetSplit(test_X,  test_y,  shape)
-        logger.info(f"CIFAR-10 ready: train {train_X.shape}, test {test_X.shape}")
+# Load dataset
+_ds = CIFAR10Dataset()
+images = _ds.train.images.to(device)
+test_images = _ds.test.images.to(device)
+train_targets = _ds.train.targets
+test_targets = _ds.test.targets
 
-_ds = Dataset(25151)
-train_imgs = _ds.train.images.reshape(-1, *_ds.train.image_shape)
-images = torch.tensor(train_imgs, dtype=torch.float32, device=device)
-targets = _ds.train.targets
-logger.info(f"Dataset: images {images.shape}, targets {len(targets)} entries")
+logger.info(f"Dataset: train {images.shape}, test {test_images.shape}, targets {len(train_targets)} entries")
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
     assert embed_dim % 2 == 0, "embed_dim must be even"
@@ -141,29 +199,81 @@ def build_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
     np_pe = get_2d_sincos_pos_embed(embed_dim, grid_size)
     return torch.from_numpy(np_pe).float()
 
+def fourier_coord_embedding(cx, cy, sz, num_freqs=4):
+    """
+    cx, cy, sz: (...,) тензоры или скаляры в [0,1]
+    num_freqs: сколько частот использовать (например, 4 -> k=1,2,4,8)
+    Возвращает: (..., 24) эмбеддинг (3 координаты * 2 * num_freqs)
+    """
+    import math
+    device = cx.device if torch.is_tensor(cx) else 'cpu'
+    ks = torch.tensor([1,2,4,8], dtype=torch.float32, device=device)[:num_freqs]  # (num_freqs,)
+    coords = torch.stack([cx, cy, sz], dim=-1)  # (..., 3)
+    # shape: (..., 3, num_freqs)
+    angles = 2 * math.pi * coords.unsqueeze(-1) * ks  # (..., 3, num_freqs)
+    sin = torch.sin(angles)  # (..., 3, num_freqs)
+    cos = torch.cos(angles)  # (..., 3, num_freqs)
+    emb = torch.cat([sin, cos], dim=-1)  # (..., 3, 2*num_freqs)
+    emb = emb.reshape(*emb.shape[:-2], 3*2*num_freqs)  # (..., 3*2*num_freqs)
+    return emb
+
 class PatchEmbedding(nn.Module):
     def __init__(self, in_ch: int, p_size: int, d_model: int, img_size: int):
         super().__init__()
         self.proj = nn.Conv2d(in_ch, d_model, kernel_size=p_size, stride=p_size)
+        self.img_size = img_size
+        self.patch_size = p_size
         n_patches = (img_size // p_size) ** 2
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        pe = build_2d_sincos_pos_embed(d_model, img_size // p_size)
-        pe = torch.cat([torch.zeros(1, d_model), pe], dim=0)
-        self.register_buffer('pos_embed', pe.unsqueeze(0))
+        self.coord_proj = nn.Linear(3*2*4, d_model)  # 3 координаты, 4 частоты, sin+cos
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.size(0)
-        x = self.proj(x).flatten(2).transpose(1, 2)
+    def forward(self, x: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor, sz: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W), cx/cy/sz: (B,) - один патч
+        B = x.shape[0]
+        x = self.proj(x).flatten(2).transpose(1, 2)  # (B, n_patches, d_model)
+        # Обычно n_patches=1, оставим универсальность
+        coord_emb = fourier_coord_embedding(cx, cy, sz)  # (B, 24)
+        coord_emb = self.coord_proj(coord_emb)  # (B, d_model)
+        coord_emb = coord_emb.unsqueeze(1).expand(-1, x.size(1), -1)
+        x = x + coord_emb
         cls = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls, x], dim=1)
-        return x + self.pos_embed
+        x = torch.cat([cls, x], dim=1)  # (B, 1+n_patches, d_model)
+        return x
+
+class MemoryTransformer(nn.Module):
+    """Memory transformer для обработки истории патчей."""
+    def __init__(self, in_ch: int, p_size: int, d_model: int, img_size: int):
+        super().__init__()
+        self.patch_emb = PatchEmbedding(in_ch, p_size, d_model, img_size)
+        self.coord_proj = nn.Linear(3*2*4, d_model)  # 3 координаты, 4 частоты, sin+cos
+
+    def forward(self, x: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor, sz: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C, H, W), cx/cy/sz: (B, T) - история патчей
+        B, T = x.shape[:2]
+        
+        # Обрабатываем каждый патч отдельно
+        tokens_list = []
+        for t in range(T):
+            x_t = x[:, t]  # (B, C, H, W)
+            cx_t = cx[:, t]  # (B,)
+            cy_t = cy[:, t]  # (B,)
+            sz_t = sz[:, t]  # (B,)
+            tokens_t = self.patch_emb(x_t, cx_t, cy_t, sz_t)  # (B, 1+n_patches, d_model)
+            tokens_list.append(tokens_t)
+        
+        # Склеиваем по времени
+        tokens = torch.cat(tokens_list, dim=1)  # (B, T*(1+n_patches), d_model)
+        return tokens
 
 class ViT(nn.Module):
     """ViT backbone + hybrid heads for Decision / Class / Move / Zoom and Critic."""
     def __init__(self, in_ch: int, img_size: int, p_size: int, d_model: int, n_layers: int, n_heads: int, n_classes: int):
         super().__init__()
         self.n_classes = n_classes
+        self.img_size = img_size
+        self.patch_size = p_size
         self.patch_emb = PatchEmbedding(in_ch, p_size, d_model, img_size)
+        self.memory_transformer = MemoryTransformer(in_ch, p_size, d_model, img_size)
         enc_layer = nn.TransformerEncoderLayer(d_model, n_heads, dim_feedforward=4 * d_model, batch_first=True, norm_first=True)
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
         # Heads
@@ -174,10 +284,17 @@ class ViT(nn.Module):
         self.critic        = nn.Linear(d_model, 1)
         self.decoder       = nn.Sequential(nn.Linear(d_model, 4*d_model), nn.ReLU(), nn.Linear(4*d_model, 3*p_size*p_size))
 
-    def forward(self, x: torch.Tensor):
-        tokens = self.patch_emb(x)
+    def forward(self, x: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor, sz: torch.Tensor):
+        # Определяем, история это или один патч по размерности x
+        if len(x.shape) == 4:  # (B, C, H, W) - один патч
+            tokens = self.patch_emb(x, cx, cy, sz)  # (B, 1+n_patches, d_model)
+        elif len(x.shape) == 5:  # (B, T, C, H, W) - история
+            tokens = self.memory_transformer(x, cx, cy, sz)  # (B, T*(1+n_patches), d_model)
+        else:
+            raise ValueError(f"Unexpected input shape: {x.shape}")
+            
         out = self.transformer(tokens)
-        cls = out[:, 0]
+        cls = out[:, 0]  # Первый токен (CLS)
         # Clamp logits to avoid extreme values that may overflow after sigmoid
         decision_logit = torch.clamp(self.decision_head(cls).squeeze(-1), -10.0, 10.0)  # (B,)
         class_logits   = self.class_head(cls)                 # (B,K)
@@ -188,7 +305,10 @@ class ViT(nn.Module):
         # unpack move/zoom params
         mu_move_raw, log_sigma_move = move_params[:, :2], move_params[:, 2:]
         mu_move = torch.sigmoid(mu_move_raw)  # Force mean to be in [0, 1]
-        mu_zoom, log_sigma_zoom = zoom_params[:, :1], zoom_params[:, 1:]
+        # Fix zoom: scale mu_zoom to [1, z_max] range
+        mu_zoom_raw, log_sigma_zoom = zoom_params[:, :1], zoom_params[:, 1:]
+        z_max = self.img_size / self.patch_size
+        mu_zoom = 1.0 + (z_max - 1.0) * torch.sigmoid(mu_zoom_raw)  # Scale to [1, z_max]
         return {
             'decision_logit': decision_logit,
             'class_logits': class_logits,
@@ -297,7 +417,7 @@ class CIFAREnv(gym.Env):
         self.data, self.labels = data, labels
         self.N = data.size(0)
         self.patch_size = patch_size   # output tensor resolution (e.g., 16)
-        self.img_hw = 32               # CIFAR size (square)
+        self.img_hw = data.shape[-1]   # CIFAR size (square)
         # maximum zoom factor (see docstring)
         self.z_max = self.img_hw / self.patch_size
         self.max_steps = max_steps
@@ -313,8 +433,14 @@ class CIFAREnv(gym.Env):
         self.ptr = 0
         self.interp_mode = CFG.get('interp_mode', 'bilinear')
         self.history = []
-        # start with full view (z=1)
-        self.cur_view_size = self.img_hw
+        # start with zoom=2 to make movement visible
+        self.cur_view_size = self.img_hw // 2  # Start with 16x16 view instead of 32x32
+        self.last_pos = None
+        # --- История для memory transformer ---
+        self.obs_history = []
+        self.cx_history = []
+        self.cy_history = []
+        self.sz_history = []
 
     def reset(self):
         idx = self.ptr % self.N
@@ -322,14 +448,26 @@ class CIFAREnv(gym.Env):
         self.img = self.data[idx]
         self.label = int(self.labels[idx])
         self.steps = 0
-        # start from centre with z=1
+        # start from centre with initial zoom
         centre = (self.img_hw - self.cur_view_size)//2
         self.y = self.x = centre
+        self.last_pos = np.array([self.x, self.y])
         
         # Start history for visualization
         self.history = [{'full_image': self.img.cpu().numpy()}]
-        
-        return self._get_patch(), {}
+        # --- История для memory transformer ---
+        self.obs_history = []
+        self.cx_history = []
+        self.cy_history = []
+        self.sz_history = []
+        # Добавляем первый патч и координаты в историю
+        patch = self._get_patch()
+        cx, cy, sz = self.get_patch_coords()
+        self.obs_history.append(patch)
+        self.cx_history.append(cx)
+        self.cy_history.append(cy)
+        self.sz_history.append(sz)
+        return patch, {}
 
     def _get_patch(self):
         H, W = self.img.shape[1:]
@@ -356,7 +494,7 @@ class CIFAREnv(gym.Env):
         self.steps += 1
         reward = 0.0
         done = False
-        info = {'exploration_move': 0, 'off_center_move': 0}
+        info = {}
 
         decision = int(action['decision'])
         if decision == 1:  # classify now
@@ -369,15 +507,10 @@ class CIFAREnv(gym.Env):
             # Log action for visualization
             self.history.append({'decision': 1, 'class': pred_class, 'view_size': self.cur_view_size, 'x': self.x, 'y': self.y})
         else:
-            info['exploration_move'] = 1
             # continue exploring: use move & zoom
             x_norm_raw, y_norm_raw = action['move']
             x_norm = np.clip(x_norm_raw, 0.0, 1.0)
             y_norm = np.clip(y_norm_raw, 0.0, 1.0)
-
-            # Add off-center metric
-            is_off_center = x_norm < 0.3 or x_norm > 0.7 or y_norm < 0.3 or y_norm > 0.7
-            info['off_center_move'] = 1 if is_off_center else 0
 
             z_factor = float(action['zoom'])
             z_factor = max(1.0, min(self.z_max, z_factor))
@@ -389,13 +522,41 @@ class CIFAREnv(gym.Env):
             # centre the viewport on chosen point while keeping inside image
             x0 = max(0, min(self.img_hw - view_size, cx - view_size // 2))
             y0 = max(0, min(self.img_hw - view_size, cy - view_size // 2))
+            
+            current_pos = np.array([x0, y0])
+            
+            # Unified exploration rewards/penalties
+            if self.last_pos is not None:
+                distance = np.linalg.norm(current_pos - self.last_pos)
+                # Reward for exploration: more movement = more reward
+                exploration_reward = min(distance / self.img_hw, 1.0) * cfg.exploration_bonus
+                reward += exploration_reward
+                
+                # Only penalize if agent is truly stuck (very small movement)
+                if distance < self.patch_size / 8:  # Reduced threshold
+                    reward -= cfg.stagnation_penalty
+            
+            self.last_pos = current_pos
+
             self.x, self.y = x0, y0
             self.cur_view_size = view_size
+            
+            # Small step penalty to encourage efficiency
             reward -= cfg.step_penalty
+            
             # Log action for visualization
             self.history.append({'decision': 0, 'view_size': view_size, 'x': x0, 'y': y0})
 
+        # Penalty for each action to encourage efficiency
+        reward -= cfg.action_penalty
+
         obs = self._get_patch()
+        cx, cy, sz = self.get_patch_coords()
+        # --- Добавляем в историю ---
+        self.obs_history.append(obs)
+        self.cx_history.append(cx)
+        self.cy_history.append(cy)
+        self.sz_history.append(sz)
         
         truncated = (self.steps >= self.max_steps)
         
@@ -404,51 +565,168 @@ class CIFAREnv(gym.Env):
 
         return obs, reward, done, truncated, info
 
+    def get_patch_coords(self):
+        # Центр текущего патча (x, y) и масштаб (z)
+        # x, y — левый верхний угол, cur_view_size — размер окна
+        cx = self.x + self.cur_view_size / 2
+        cy = self.y + self.cur_view_size / 2
+        img_hw = self.img_hw
+        # Нормализация центра
+        cx_norm = cx / (img_hw - 1)
+        cy_norm = cy / (img_hw - 1)
+        # Масштаб (z = img_hw / cur_view_size)
+        z = img_hw / self.cur_view_size
+        # Логарифм и нормализация (максимальный зум — z_max = img_hw / patch_size)
+        sz = np.log2(z)
+        sz_max = np.log2(self.z_max)
+        sz_norm = sz / sz_max if sz_max > 0 else 0.0
+        return cx_norm, cy_norm, sz_norm
+
+    def get_history(self):
+        # Вернуть всю историю патчей и pos-эмбеддингов (np.array)
+        return (np.stack(self.obs_history, axis=0),
+                np.array(self.cx_history, dtype=np.float32),
+                np.array(self.cy_history, dtype=np.float32),
+                np.array(self.sz_history, dtype=np.float32))
+
+def get_batch_history(envs):
+    # Вернёт батч истории для всех envs: (B, T, ...)
+    obs_list, cx_list, cy_list, sz_list = [], [], [], []
+    for env in envs.envs:
+        obs, cx, cy, sz = env.get_history()
+        obs_list.append(obs)
+        cx_list.append(cx)
+        cy_list.append(cy)
+        sz_list.append(sz)
+    # Привести к одинаковой длине (padding, если нужно)
+    max_T = max(len(o) for o in obs_list)
+    def pad(arr, shape, value=0):
+        out = np.full(shape, value, dtype=arr.dtype)
+        out[:len(arr)] = arr
+        return out
+    obs_batch = np.stack([pad(o, (max_T,)+o.shape[1:]) for o in obs_list], axis=0)
+    cx_batch = np.stack([pad(c, (max_T,)) for c in cx_list], axis=0)
+    cy_batch = np.stack([pad(c, (max_T,)) for c in cy_list], axis=0)
+    sz_batch = np.stack([pad(s, (max_T,)) for s in sz_list], axis=0)
+    return obs_batch, cx_batch, cy_batch, sz_batch
+
+def evaluate_on_test_set(agent, n_episodes=100):
+    """Evaluate agent on test set without training."""
+    # Create test environments
+    test_envs = SyncVectorEnv([lambda: CIFAREnv(test_images, test_targets, CFG['patch_size'], CFG['max_episode_steps'], _ds.test.n_classes) for _ in range(min(CFG['n_envs'], 8))])
+    
+    agent.eval()
+    total_rewards = []
+    total_accuracies = []
+    total_episode_lengths = []
+    
+    episodes_done = 0
+    obs_batch, _ = test_envs.reset()
+    obs_batch = torch.tensor(obs_batch, device=device)
+    
+    while episodes_done < n_episodes:
+        # --- Получаем всю историю для каждого env ---
+        obs_hist, cx_hist, cy_hist, sz_hist = get_batch_history(test_envs)
+        obs_hist = torch.tensor(obs_hist, device=device, dtype=torch.float32)
+        cx_hist = torch.tensor(cx_hist, device=device, dtype=torch.float32)
+        cy_hist = torch.tensor(cy_hist, device=device, dtype=torch.float32)
+        sz_hist = torch.tensor(sz_hist, device=device, dtype=torch.float32)
+        with torch.no_grad():
+            params = agent(obs_hist, cx_hist, cy_hist, sz_hist)
+            dist = HybridActionDist(params)
+            act_dict = dist.sample()
+        
+        env_actions = {
+            'decision': act_dict['decision'].cpu().numpy(),
+            'class':    act_dict['class'].cpu().numpy(),
+            'move':     act_dict['move'].cpu().numpy(),
+            'zoom':     act_dict['zoom'].cpu().numpy()
+        }
+        obs_batch, rewards, dones, truncated, infos = test_envs.step(env_actions)
+        obs_batch = torch.tensor(obs_batch, device=device)
+        
+        terminated = dones | truncated
+        for i, term in enumerate(terminated):
+            if term and episodes_done < n_episodes:
+                # Extract episode info
+                if hasattr(infos, 'get') and 'episode_history' in infos.get('final_info', [{}])[i]:
+                    history = infos['final_info'][i]['episode_history']
+                    episode_reward = sum([step.get('reward', 0) for step in history[1:]])  # Skip first entry
+                    episode_length = len(history) - 1
+                    
+                    # Check if final decision was correct
+                    final_step = history[-1]
+                    if final_step.get('decision') == 1:
+                        pred_class = final_step.get('class', -1)
+                        true_label = test_targets[episodes_done % len(test_targets)]
+                        accuracy = 1.0 if pred_class == true_label else 0.0
+                    else:
+                        accuracy = 0.0  # Didn't classify
+                    
+                    total_rewards.append(episode_reward)
+                    total_accuracies.append(accuracy)
+                    total_episode_lengths.append(episode_length)
+                    episodes_done += 1
+    
+    test_envs.close()
+    agent.train()
+    
+    return {
+        'test_accuracy': np.mean(total_accuracies),
+        'test_avg_return': np.mean(total_rewards),
+        'test_avg_length': np.mean(total_episode_lengths),
+        'test_episodes': len(total_rewards)
+    }
+
 def make_env(seed):
     def thunk():
-        return CIFAREnv(images, targets, CFG['patch_size'], CFG['max_episode_steps'], _ds.train.n_classes)
+        return CIFAREnv(images, train_targets, CFG['patch_size'], CFG['max_episode_steps'], _ds.train.n_classes)
     return thunk
 
 envs = SyncVectorEnv([make_env(i) for i in range(CFG['n_envs'])])
 
 def train_ppo(agent):
-    wandb.init()
     cfg = wandb.config
     opt = optim.AdamW(agent.parameters(), lr=cfg.lr)
-    buf = {k: [] for k in ['obs', 'act', 'logp', 'val', 'rew', 'done']} # Removed aux and time
+    buf = {k: [] for k in ['obs', 'cx', 'cy', 'sz', 'act', 'logp', 'val', 'rew', 'done']} # Добавляем координаты
     step_count, ep_count = 0, 0
     ep_rewards, ep_lengths = [], []
     cur_rewards = np.zeros(CFG['n_envs'], dtype=float)
     cur_lengths = np.zeros(CFG['n_envs'], dtype=int)
     next_log = 1000
     next_log_and_checkpoint_step = cfg.viz_interval
-
-    # --- Off-center move tracking ---
-    total_exploration_moves = 0
-    total_off_center_moves = 0
-    # ---
+    next_test_eval = 50000  # Evaluate on test set every 50k steps
 
     obs_batch, info = envs.reset()
     obs_batch = torch.tensor(obs_batch, device=device)
     pbar = tqdm(total=CFG['env_steps'], desc='Training')
 
+    # Track detailed reward components
+    external_rewards = []
+    intrinsic_rewards = []
+    surprise_values = []
+    uncertainty_values = []
+
     while step_count < CFG['env_steps']:
         #rollout
         for _ in range(cfg.rollout_length):
+            # --- Получаем всю историю для каждого env ---
+            obs_hist, cx_hist, cy_hist, sz_hist = get_batch_history(envs)
+            obs_hist = torch.tensor(obs_hist, device=device, dtype=torch.float32)  # (B, T, C, H, W)
+            cx_hist = torch.tensor(cx_hist, device=device, dtype=torch.float32)    # (B, T)
+            cy_hist = torch.tensor(cy_hist, device=device, dtype=torch.float32)    # (B, T)
+            sz_hist = torch.tensor(sz_hist, device=device, dtype=torch.float32)    # (B, T)
             with torch.no_grad():
-                params = agent(obs_batch)
+                params = agent(obs_hist, cx_hist, cy_hist, sz_hist)
                 dist = HybridActionDist(params)
                 act_dict = dist.sample()
                 lp = dist.log_prob(act_dict)
                 vals = params['value']
 
                 # --- Intrinsic Reward Calculation ---
-                # Surprise: reconstruction loss of the CURRENT observation
                 recon_pred = params['recon']
-                true_flat = obs_batch.view(obs_batch.size(0), -1)
+                true_flat = obs_hist[:, -1].view(obs_hist.size(0), -1)  # только последний патч
                 surprise = F.mse_loss(recon_pred, true_flat, reduction='none').mean(dim=1)
-
-                # Uncertainty: policy entropy for the CURRENT observation
                 uncertainty = dist.entropy()
 
             env_actions = {
@@ -459,15 +737,14 @@ def train_ppo(agent):
             }
             nxt, ext_rews, term, tru, infos = envs.step(env_actions)
 
-            # Accumulate off-center move stats
-            if '_final_info' in infos and 'exploration_move' in infos:
-                mask = infos['_final_info']
-                total_exploration_moves += np.sum(np.array(infos['exploration_move'])[mask])
-                total_off_center_moves += np.sum(np.array(infos['off_center_move'])[mask])
-
-            # Combine rewards
             intrinsic_reward = cfg.surprise_coef * surprise - cfg.intrinsic_coef * uncertainty
             total_rewards = torch.tensor(ext_rews, device=device, dtype=torch.float32) + intrinsic_reward
+            
+            # Track reward components
+            external_rewards.extend(ext_rews)
+            intrinsic_rewards.extend(intrinsic_reward.cpu().numpy())
+            surprise_values.extend(surprise.cpu().numpy())
+            uncertainty_values.extend(uncertainty.cpu().numpy())
             
             dones = term | tru
 
@@ -476,6 +753,17 @@ def train_ppo(agent):
                 logged = visualize_and_checkpoint(agent, infos, step_count)
                 if logged:
                     next_log_and_checkpoint_step += cfg.viz_interval
+            
+            # --- Test Set Evaluation ---
+            if step_count >= next_test_eval:
+                test_results = evaluate_on_test_set(agent, n_episodes=50)
+                wandb.log({
+                    "test_accuracy": test_results['test_accuracy'],
+                    "test_avg_return": test_results['test_avg_return'],
+                    "test_avg_length": test_results['test_avg_length']
+                }, step=step_count)
+                logger.info(f"Test evaluation at step {step_count}: Accuracy={test_results['test_accuracy']:.3f}, Return={test_results['test_avg_return']:.3f}")
+                next_test_eval += 50000
             
             cur_rewards += total_rewards.cpu().numpy()
             cur_lengths += 1
@@ -495,6 +783,10 @@ def train_ppo(agent):
             buf['act'].append(packed_actions)
 
             buf['obs'].append(obs_batch)
+            # Сохраняем координаты последних патчей
+            buf['cx'].append(cx_hist[:, -1])  # (B,)
+            buf['cy'].append(cy_hist[:, -1])  # (B,)
+            buf['sz'].append(sz_hist[:, -1])  # (B,)
             buf['logp'].append(lp)
             buf['val'].append(vals)
             buf['rew'].append(total_rewards)
@@ -508,12 +800,21 @@ def train_ppo(agent):
                 pbar.set_postfix(ep=int(ep_count))
 
         with torch.no_grad():
-            last_val = agent(obs_batch)['value']
+            obs_hist, cx_hist, cy_hist, sz_hist = get_batch_history(envs)
+            obs_hist = torch.tensor(obs_hist, device=device, dtype=torch.float32)
+            cx_hist = torch.tensor(cx_hist, device=device, dtype=torch.float32)
+            cy_hist = torch.tensor(cy_hist, device=device, dtype=torch.float32)
+            sz_hist = torch.tensor(sz_hist, device=device, dtype=torch.float32)
+            last_val = agent(obs_hist, cx_hist, cy_hist, sz_hist)['value']
+        
         buf['val'].append(last_val)
 
         advs, rets = compute_gae(torch.stack(buf['rew']), torch.stack(buf['val']), torch.stack(buf['done']), cfg.gamma, cfg.gae_lambda)
         
         obs_f   = torch.cat(buf['obs']).view(-1, *buf['obs'][0].shape[1:])
+        cx_f    = torch.cat(buf['cx']).view(-1)
+        cy_f    = torch.cat(buf['cy']).view(-1)
+        sz_f    = torch.cat(buf['sz']).view(-1)
         act_f   = torch.cat(buf['act']).view(-1, buf['act'][0].shape[-1])
         lp_f    = torch.cat(buf['logp']).view(-1)
         advs_f  = advs.view(-1)
@@ -529,6 +830,9 @@ def train_ppo(agent):
             for i in range(0, len(obs_f), cfg.batch_size):
                 idx = perm[i:i + cfg.batch_size]
                 b_obs = obs_f[idx]
+                b_cx = cx_f[idx]
+                b_cy = cy_f[idx]
+                b_sz = sz_f[idx]
                 b_packed = act_f[idx]
                 
                 b_decision = b_packed[:,0].long()
@@ -541,7 +845,10 @@ def train_ppo(agent):
                 b_ret = rets_f[idx]
                 b_adv = advs_f[idx]
 
-                params_b = agent(b_obs)
+                # Передаём отдельные патчи с реальными координатами в agent
+                # b_obs имеет форму (batch_size, C, H, W)
+                # b_cx, b_cy, b_sz имеют форму (batch_size,) - реальные координаты
+                params_b = agent(b_obs, b_cx, b_cy, b_sz)
                 dist_b   = HybridActionDist(params_b)
                 new_lp   = dist_b.log_prob(b_act_dict)
                 ent      = dist_b.entropy().mean()
@@ -576,7 +883,15 @@ def train_ppo(agent):
         avg_ent = tot_ent / cnt
         avg_rec = tot_rec / cnt
         accuracy = correct_predictions / (len(obs_f) * cfg.update_epochs)
-        off_center_ratio = total_off_center_moves / total_exploration_moves if total_exploration_moves > 0 else 0
+
+        # Log detailed reward breakdown every 1000 steps
+        if step_count % 1000 == 0 and external_rewards:
+            wandb.log({
+                "reward_external_mean": np.mean(external_rewards[-1000:]),
+                "reward_intrinsic_mean": np.mean(intrinsic_rewards[-1000:]),
+                "surprise_mean": np.mean(surprise_values[-1000:]),
+                "uncertainty_mean": np.mean(uncertainty_values[-1000:]),
+            }, step=step_count)
 
         wandb.log({
             "step": step_count,
@@ -585,12 +900,7 @@ def train_ppo(agent):
             "entropy": avg_ent,
             "accuracy": accuracy,
             "recon_loss": avg_rec,
-            "off_center_ratio": off_center_ratio,
         }, step=step_count)
-
-        # Reset counters for the next rollout
-        total_exploration_moves = 0
-        total_off_center_moves = 0
 
         if ep_count >= next_log:
             avg_return = np.mean(ep_rewards[-next_log:])
@@ -602,6 +912,27 @@ def train_ppo(agent):
             next_log += cfg.rollout_length
 
     pbar.close()
+    
+    # Final test set evaluation
+    logger.info("Running final test set evaluation...")
+    final_test_results = evaluate_on_test_set(agent, n_episodes=200)
+    wandb.log({
+        "final_test_accuracy": final_test_results['test_accuracy'],
+        "final_test_avg_return": final_test_results['test_avg_return'],
+        "final_test_avg_length": final_test_results['test_avg_length']
+    }, step=step_count)
+    
+    # Detailed reward analysis
+    logger.info(f"Final Test Results:")
+    logger.info(f"  Accuracy: {final_test_results['test_accuracy']:.3f}")
+    logger.info(f"  Avg Return: {final_test_results['test_avg_return']:.3f}")
+    logger.info(f"  Avg Episode Length: {final_test_results['test_avg_length']:.1f}")
+    
+    if external_rewards:
+        logger.info(f"Training Reward Analysis (last 1000 steps):")
+        logger.info(f"  External Rewards: {np.mean(external_rewards[-1000:]):.3f}")
+        logger.info(f"  Intrinsic Rewards: {np.mean(intrinsic_rewards[-1000:]):.3f}")
+        logger.info(f"  Total Rewards: {np.mean(external_rewards[-1000:]) + np.mean(intrinsic_rewards[-1000:]):.3f}")
 
 def create_episode_visualization(history_data, save_dir="visualizations"):
     """Creates a GIF visualization of an agent's episode."""
@@ -639,13 +970,15 @@ def create_episode_visualization(history_data, save_dir="visualizations"):
         
         # Scale coords to the 256x256 image
         scale_factor = 256 / 32
-        box_x0 = x * scale_factor
-        box_y0 = y * scale_factor
-        box_x1 = (x + view_size) * scale_factor
-        box_y1 = (y + view_size) * scale_factor
+        box_x0 = max(0, min(256, x * scale_factor))
+        box_y0 = max(0, min(256, y * scale_factor))
+        box_x1 = max(0, min(256, (x + view_size) * scale_factor))
+        box_y1 = max(0, min(256, (y + view_size) * scale_factor))
         
-        # Draw semi-transparent rectangle for viewport
-        draw_overlay.rectangle([box_x0, box_y0, box_x1, box_y1], fill=(255, 255, 0, 100), outline=(255, 255, 0, 200), width=2)
+        # Only draw rectangle if it has valid dimensions
+        if box_x1 > box_x0 and box_y1 > box_y0:
+            # Draw semi-transparent rectangle for viewport
+            draw_overlay.rectangle([box_x0, box_y0, box_x1, box_y1], fill=(255, 255, 0, 100), outline=(255, 255, 0, 200), width=2)
         frame = Image.alpha_composite(frame, overlay)
         
         # Add text
@@ -677,34 +1010,61 @@ def save_checkpoint(agent, path="checkpoints/latest_checkpoint.pth"):
 
 def visualize_and_checkpoint(agent, infos, step_count):
     """
-    If a completed episode is found in infos, creates a visualization, logs it,
-    and saves a model checkpoint. Returns True if successful, False otherwise.
+    Проверяем, есть ли завершённый эпизод среди словарей infos.
+    Если найдена история эпизода – создаём GIF, логируем его в wandb
+    и сохраняем чекпойнт модели.
+    Возвращает True, если визуализация/чекпойнт были залогированы.
     """
-    if not infos.get("_final_info", np.zeros(CFG['n_envs'], dtype=bool)).any():
+    # `infos` от SyncVectorEnv – это список словарей длиной n_envs
+    if infos is None:
         return False
-        
-    final_infos = infos["final_info"][infos["_final_info"]]
-    history_to_log = None
-    for info_dict in final_infos:
-        if info_dict and "episode_history" in info_dict:
-            history_to_log = info_dict["episode_history"]
-            break
-    
-    if history_to_log:
-        video = create_episode_visualization(history_to_log)
-        if video:
-            wandb.log({"episode_visualization": video}, step=step_count)
-        
-        save_checkpoint(agent)
-        return True
 
-    return False
+    if isinstance(infos, dict):  # edge-case, когда vec.env агрегирует
+        # Попробуем извлечь list из ключа 'final_info' (Gym>=0.26)
+        if 'final_info' in infos and isinstance(infos['final_info'], (list, tuple)):
+            info_dicts = infos['final_info']
+        else:
+            info_dicts = [infos]
+    else:
+        info_dicts = infos  # уже list/tuple
+
+    history_to_log = None
+    for info_dict in info_dicts:
+        if info_dict and 'episode_history' in info_dict:
+            history_to_log = info_dict['episode_history']
+            break
+
+    if not history_to_log:
+        return False
+
+    video = create_episode_visualization(history_to_log)
+    if video:
+        wandb.log({"episode_visualization": video}, step=step_count)
+    save_checkpoint(agent)
+    return True
 
 # ---------------- Entry point ------------------
 
-def run_sweep():
+def run_sweep(config=None):
     """Create a fresh model for each sweep run and train it."""
-    os.makedirs('checkpoints', exist_ok=True)
+    with wandb.init(config=config):
+        os.makedirs('checkpoints', exist_ok=True)
+        in_ch = _ds.train.image_shape[0]
+        model = ViT(in_ch=in_ch,
+                    img_size=CFG['patch_size'],
+                    p_size=CFG['patch_size'],
+                    d_model=CFG['d_model'],
+                    n_layers=CFG['n_layers'],
+                    n_heads=CFG['n_heads'],
+                    n_classes=_ds.train.n_classes).to(device)
+        train_ppo(model)
+
+def main():
+    """Запускает один тренировочный прогон с конфигурацией из CFG."""
+    # Инициализируем wandb для одного запуска
+    wandb.init(project="cifar_active_sweep", config=CFG, name="manual-good-params-run")
+
+    # Создаём модель
     in_ch = _ds.train.image_shape[0]
     model = ViT(in_ch=in_ch,
                 img_size=CFG['patch_size'],
@@ -713,9 +1073,21 @@ def run_sweep():
                 n_layers=CFG['n_layers'],
                 n_heads=CFG['n_heads'],
                 n_classes=_ds.train.n_classes).to(device)
+
+    # Запускаем тренировку
     train_ppo(model)
 
-
 if __name__ == '__main__':
-    # Launch wandb agent; remove count to allow indefinite runs (parallel agents possible)
-    wandb.agent(sweep_id, function=run_sweep)
+    # --- Выберите одно из действий ---
+
+    # 1. Чтобы запустить один эксперимент с настройками из CFG (ДЕЙСТВИЕ ПО УМОЛЧАНИЮ)
+    # main()
+
+    # 2. Чтобы создать новый sweep, раскомментируйте следующую строку:
+    sweep_id = wandb.sweep(sweep_config, project="cifar_active_sweep")
+    print(f"Created sweep with ID: {sweep_id}")
+    print(f"Sweep URL: https://wandb.ai/vladsteam/cifar_active_sweep/sweeps/{sweep_id}")
+
+    # 3. Чтобы запустить sweep-агент, закомментируйте main() выше и раскомментируйте следующие строки:
+    # sweep_id = "PASTE_YOUR_SWEEP_ID_HERE"  # <--- Вставьте сюда ID вашего sweep'а
+    # wandb.agent(sweep_id, function=run_sweep)
