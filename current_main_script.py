@@ -16,6 +16,8 @@ from PIL import Image, ImageDraw, ImageFont
 import imageio
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -23,19 +25,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 logger = logging.getLogger(__name__)
 
 CFG = {
-    'env_steps': 1000000,
-    'rollout_length': 128,
+    'env_steps': 100,
+    'max_episode_steps': 100,
+    'n_envs': 1,
+    'patch_size': 8,
+    'd_model': 128,
+    'n_heads': 4,
+    'n_layers': 4,
+    'lr': 0.00004,
+    'batch_size': 128,
     'update_epochs': 4,
     'gamma': 0.96,
     'gae_lambda': 0.84,
     'clip_epsilon': 0.25,
-    'lr': 0.00004,
-    'batch_size': 128,
-    'd_model': 128,
-    'n_heads': 4,
-    'n_layers': 4,
-    'patch_size': 8,
-    'step_penalty': 0,
     'entropy_coef': 0.04,
     'intrinsic_coef': 0.01,
     'recon_coef': 0.09,
@@ -43,17 +45,19 @@ CFG = {
     'eval_interval': 10_000,
     'max_episode_steps': 100,
     'dataset_seed': 80411,
-    'n_envs': 16,
+    'n_envs': 1,
     'n_move': 4,
     'interp_mode': 'bicubic',
     'surprise_coef': 0.20,
     'viz_interval': 200000,
     'grad_clip_norm': 0.4,
+    'step_penalty': 0,
     'stagnation_penalty': 0.02,
-    'correct_bonus': 3, # Custom parameter from sweep
-    'wrong_penalty': 0,   # Custom parameter from sweep
-    'exploration_bonus': 0.1,  # Reward for exploration movement
-    'action_penalty': 0.05,  # Penalty for each action to encourage efficiency
+    'correct_bonus': 3,
+    'wrong_penalty': 0,
+    'exploration_bonus': 1.0,
+    'action_penalty': 0.05,
+    'dataset_seed': 80411,
 }
 
 sweep_config = {
@@ -170,34 +174,36 @@ class CIFAR10Dataset:
 
 # Load dataset
 _ds = CIFAR10Dataset()
-images = _ds.train.images.to(device)
+# Ограничиваем датасет до одной картинки для анализа
+single_image_idx = 0  # Можно изменить на любую картинку
+images = _ds.train.images[single_image_idx:single_image_idx+1].to(device)  # Только одна картинка
 test_images = _ds.test.images.to(device)
-train_targets = _ds.train.targets
+train_targets = _ds.train.targets[single_image_idx:single_image_idx+1]  # Только один таргет
 test_targets = _ds.test.targets
 
-logger.info(f"Dataset: train {images.shape}, test {test_images.shape}, targets {len(train_targets)} entries")
+logger.info(f"Dataset: train image {images.shape}, test {test_images.shape}, target {train_targets}")
 
-def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
-    assert embed_dim % 2 == 0, "embed_dim must be even"
-    omega = np.arange(embed_dim // 2, dtype=np.float64) / (embed_dim / 2.0)
-    omega = 1.0 / (10000 ** omega)
-    pos = pos.reshape(-1)
-    out = np.einsum('m,d->md', pos, omega)
-    return np.concatenate([np.sin(out), np.cos(out)], axis=1)
+# def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
+#     assert embed_dim % 2 == 0, "embed_dim must be even"
+#     omega = np.arange(embed_dim // 2, dtype=np.float64) / (embed_dim / 2.0)
+#     omega = 1.0 / (10000 ** omega)
+#     pos = pos.reshape(-1)
+#     out = np.einsum('m,d->md', pos, omega)
+#     return np.concatenate([np.sin(out), np.cos(out)], axis=1)
 
-def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> np.ndarray:
-    assert embed_dim % 2 == 0, "embed_dim must be even"
-    dim_half = embed_dim // 2
-    gh = np.arange(grid_size, dtype=np.float32)
-    gw = np.arange(grid_size, dtype=np.float32)
-    grid = np.stack(np.meshgrid(gw, gh), axis=0).reshape(2, -1)
-    emb_h = get_1d_sincos_pos_embed_from_grid(dim_half, grid[0])
-    emb_w = get_1d_sincos_pos_embed_from_grid(dim_half, grid[1])
-    return np.concatenate([emb_h, emb_w], axis=1)
+# def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> np.ndarray:
+#     assert embed_dim % 2 == 0, "embed_dim must be even"
+#     dim_half = embed_dim // 2
+#     gh = np.arange(grid_size, dtype=np.float32)
+#     gw = np.arange(grid_size, dtype=np.float32)
+#     grid = np.stack(np.meshgrid(gw, gh), axis=0).reshape(2, -1)
+#     emb_h = get_1d_sincos_pos_embed_from_grid(dim_half, grid[0])
+#     emb_w = get_1d_sincos_pos_embed_from_grid(dim_half, grid[1])
+#     return np.concatenate([emb_h, emb_w], axis=1)
 
-def build_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
-    np_pe = get_2d_sincos_pos_embed(embed_dim, grid_size)
-    return torch.from_numpy(np_pe).float()
+# def build_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
+#     np_pe = get_2d_sincos_pos_embed(embed_dim, grid_size)
+#     return torch.from_numpy(np_pe).float()
 
 def fourier_coord_embedding(cx, cy, sz, num_freqs=4):
     """
@@ -397,8 +403,7 @@ def compute_ppo_loss(logits, values, actions, old_log_probs, advantages, returns
     total_loss = policy_loss + 0.5 * value_loss - entropy_coef * entropy
     return total_loss, policy_loss, value_loss, entropy
 
-def compute_gae(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor,
-                gamma: float, lam: float):
+def compute_gae(rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor, gamma: float, lam: float):
     T, N = rewards.shape
     advantages = torch.zeros((T, N), device=device)
     last_adv = torch.zeros(N, device=device)
@@ -503,7 +508,8 @@ class CIFAREnv(gym.Env):
                 reward += cfg.correct_bonus
             else:
                 reward -= cfg.wrong_penalty
-            done = True
+            # Убираем done = True - позволяем агенту продолжать исследование
+            # done = True  # ЗАКОММЕНТИРОВАНО: убираем остановку после классификации
             # Log action for visualization
             self.history.append({'decision': 1, 'class': pred_class, 'view_size': self.cur_view_size, 'x': self.x, 'y': self.y})
         else:
@@ -558,9 +564,19 @@ class CIFAREnv(gym.Env):
         self.cy_history.append(cy)
         self.sz_history.append(sz)
         
+        # Добавляем информацию о текущем состоянии для анализа
+        info['step'] = self.steps
+        info['current_pos'] = (self.x, self.y)
+        info['current_view_size'] = self.cur_view_size
+        info['decision'] = decision
+        if decision == 1:
+            info['predicted_class'] = int(action['class'])
+            info['true_class'] = self.label
+            info['correct'] = (int(action['class']) == self.label)
+        
         truncated = (self.steps >= self.max_steps)
         
-        if done or truncated:
+        if truncated: # if done or truncated:
             info['episode_history'] = self.history
 
         return obs, reward, done, truncated, info
@@ -685,6 +701,66 @@ def make_env(seed):
 
 envs = SyncVectorEnv([make_env(i) for i in range(CFG['n_envs'])])
 
+# --- Визуализация одного шага ---
+step_vis_counter = 0  # глобальный step для визуализации
+
+def log_single_step_visualization(step_info, full_image_np, step_count):
+    img = (full_image_np.transpose(1, 2, 0) * 255).astype(np.uint8)
+    base_img = Image.fromarray(img).convert("RGBA").resize((512, 512), Image.NEAREST)
+    overlay = Image.new('RGBA', base_img.size, (255, 255, 255, 0))
+    draw_overlay = ImageDraw.Draw(overlay)
+    view_size = step_info['view_size']
+    x, y = step_info['x'], step_info['y']
+    scale_factor = 512 / 32
+    box_x0 = max(0, min(512, x * scale_factor))
+    box_y0 = max(0, min(512, y * scale_factor))
+    box_x1 = max(0, min(512, (x + view_size) * scale_factor))
+    box_y1 = max(0, min(512, (y + view_size) * scale_factor))
+    if box_x1 > box_x0 and box_y1 > box_y0:
+        draw_overlay.rectangle([box_x0, box_y0, box_x1, box_y1], fill=(255, 255, 0, 100), outline=(255, 255, 0, 200), width=3)
+    frame = Image.alpha_composite(base_img, overlay)
+    try:
+        font = ImageFont.truetype("arial.ttf", 20)
+    except IOError:
+        font = ImageFont.load_default()
+    draw_text = ImageDraw.Draw(frame)
+    decision = "Classify" if step_info['decision'] == 1 else "Explore"
+    caption = f"Step: {step_count} | {decision}"
+    if 'class' in step_info:
+        caption += f" (Class {step_info['class']})"
+    caption += f" | View: {view_size}x{view_size} | Pos: ({x},{y})"
+    lines = caption.split(" | ")
+    for j, line in enumerate(lines):
+        draw_text.text((10, 10 + j*25), line, font=font, fill="white", stroke_width=2, stroke_fill="black")
+    import wandb
+    wandb.log({"step_visualization": wandb.Image(frame, caption=caption)}, step=step_count)
+
+def log_token_count_bar(n_tokens, step):
+    import wandb
+    fig, ax = plt.subplots()
+    ax.bar(['tokens'], [n_tokens], color='purple')
+    ax.set_ylim(0, n_tokens+2)
+    ax.set_title('Number of tokens (ViT input)')
+    plt.tight_layout()
+    wandb.log({'n_tokens_bar': wandb.Image(fig)}, step=step)
+    plt.close(fig)
+
+def log_tsne_embeddings(tokens, step):
+    import wandb
+    # tokens: (N, d_model), N = num tokens
+    tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, tokens.shape[0]-1))
+    emb_2d = tsne.fit_transform(tokens)
+    fig, ax = plt.subplots()
+    # Первый токен — CLS
+    ax.scatter(emb_2d[0,0], emb_2d[0,1], color='red', label='CLS', s=80, marker='*')
+    if tokens.shape[0] > 1:
+        ax.scatter(emb_2d[1:,0], emb_2d[1:,1], color='blue', label='patch tokens', s=40)
+    ax.set_title('t-SNE of input tokens (CLS=red star)')
+    ax.legend()
+    plt.tight_layout()
+    wandb.log({'tsne_tokens': wandb.Image(fig)}, step=step)
+    plt.close(fig)
+
 def train_ppo(agent):
     cfg = wandb.config
     opt = optim.AdamW(agent.parameters(), lr=cfg.lr)
@@ -798,6 +874,44 @@ def train_ppo(agent):
             if dones.any():
                 ep_count += dones.sum().item()
                 pbar.set_postfix(ep=int(ep_count))
+
+            # Log single step visualization для каждого env
+            for env_idx, env in enumerate(envs.envs):
+                if hasattr(env, 'history') and len(env.history) > 1:
+                    step_info = env.history[-1]
+                    full_image_np = env.history[0]['full_image']
+                    log_single_step_visualization(step_info, full_image_np, step_count)
+
+                    # --- Визуализация распределений и гистограмм ---
+                    # decision
+                    decision_logit = params['decision_logit'][env_idx].item()
+                    log_decision_histogram(decision_logit, step_count)
+                    # class
+                    class_logits = params['class_logits'][env_idx].cpu().numpy()
+                    true_class = env.label
+                    log_class_histogram(class_logits, true_class, step_count)
+                    # move/zoom распределения
+                    mu_move = params['mu_move'][env_idx].cpu().numpy()
+                    sigma_move = np.exp(params['log_sigma_move'][env_idx].cpu().numpy())
+                    mu_zoom = params['mu_zoom'][env_idx].cpu().numpy().item()
+                    sigma_zoom = np.exp(params['log_sigma_zoom'][env_idx].cpu().numpy().item())
+                    # sampled значения (из act_dict)
+                    sampled_move = act_dict['move'][env_idx].cpu().numpy()
+                    sampled_zoom = act_dict['zoom'][env_idx].cpu().item()
+                    log_distribution_plot(mu_move[0], sigma_move[0], sampled_move[0], 'move_x', step_count)
+                    log_distribution_plot(mu_move[1], sigma_move[1], sampled_move[1], 'move_y', step_count)
+                    log_distribution_plot(mu_zoom, sigma_zoom, sampled_zoom, 'zoom', step_count)
+                    # action histogram (move/zoom)
+                    is_zoom = abs(sampled_zoom-1) > 0.1
+                    is_move = not is_zoom
+                    log_action_histogram(is_move, is_zoom, step_count)
+
+            # 1. Получить входные токены ViT (tokens = ...)
+            tokens = params['recon']
+            # 2. log_token_count_bar(tokens.shape[1], step_count)
+            log_token_count_bar(tokens.shape[1], step_count)
+            # 3. log_tsne_embeddings(tokens[0].cpu().numpy(), step_count)
+            log_tsne_embeddings(tokens[0].cpu().numpy(), step_count)
 
         with torch.no_grad():
             obs_hist, cx_hist, cy_hist, sz_hist = get_batch_history(envs)
@@ -934,8 +1048,8 @@ def train_ppo(agent):
         logger.info(f"  Intrinsic Rewards: {np.mean(intrinsic_rewards[-1000:]):.3f}")
         logger.info(f"  Total Rewards: {np.mean(external_rewards[-1000:]) + np.mean(intrinsic_rewards[-1000:]):.3f}")
 
-def create_episode_visualization(history_data, save_dir="visualizations"):
-    """Creates a GIF visualization of an agent's episode."""
+def create_step_by_step_visualization(history_data, save_dir="visualizations"):
+    """Creates a GIF visualization showing each step of agent's exploration on a single image."""
     if not history_data:
         return None
     
@@ -947,15 +1061,21 @@ def create_episode_visualization(history_data, save_dir="visualizations"):
 
     # Convert from (C, H, W) to (H, W, C) and scale to 0-255
     full_image_np = (full_image_np.transpose(1, 2, 0) * 255).astype(np.uint8)
-    base_img = Image.fromarray(full_image_np).convert("RGBA").resize((256, 256), Image.NEAREST)
+    base_img = Image.fromarray(full_image_np).convert("RGBA").resize((512, 512), Image.NEAREST)  # Увеличиваем размер для лучшей видимости
     
     frames = []
     
     # Use a basic font
     try:
-        font = ImageFont.truetype("arial.ttf", 14)
+        font = ImageFont.truetype("arial.ttf", 20)  # Увеличиваем размер шрифта
     except IOError:
         font = ImageFont.load_default()
+
+    # Добавляем первый кадр с исходным изображением
+    frame = base_img.copy()
+    draw = ImageDraw.Draw(frame)
+    draw.text((10, 10), "Step 0: Initial view", font=font, fill="white", stroke_width=2, stroke_fill="black")
+    frames.append(frame)
 
     for i, step_info in enumerate(history_data[1:]): # Skip the first entry which is just the base image
         frame = base_img.copy()
@@ -968,27 +1088,31 @@ def create_episode_visualization(history_data, save_dir="visualizations"):
         view_size = step_info['view_size']
         x, y = step_info['x'], step_info['y']
         
-        # Scale coords to the 256x256 image
-        scale_factor = 256 / 32
-        box_x0 = max(0, min(256, x * scale_factor))
-        box_y0 = max(0, min(256, y * scale_factor))
-        box_x1 = max(0, min(256, (x + view_size) * scale_factor))
-        box_y1 = max(0, min(256, (y + view_size) * scale_factor))
+        # Scale coords to the 512x512 image
+        scale_factor = 512 / 32
+        box_x0 = max(0, min(512, x * scale_factor))
+        box_y0 = max(0, min(512, y * scale_factor))
+        box_x1 = max(0, min(512, (x + view_size) * scale_factor))
+        box_y1 = max(0, min(512, (y + view_size) * scale_factor))
         
         # Only draw rectangle if it has valid dimensions
         if box_x1 > box_x0 and box_y1 > box_y0:
             # Draw semi-transparent rectangle for viewport
-            draw_overlay.rectangle([box_x0, box_y0, box_x1, box_y1], fill=(255, 255, 0, 100), outline=(255, 255, 0, 200), width=2)
+            draw_overlay.rectangle([box_x0, box_y0, box_x1, box_y1], fill=(255, 255, 0, 100), outline=(255, 255, 0, 200), width=3)
         frame = Image.alpha_composite(frame, overlay)
         
-        # Add text
+        # Add text with more detailed information
         draw_text = ImageDraw.Draw(frame)
         decision = "Classify" if step_info['decision'] == 1 else "Explore"
-        caption = f"Step {i}: {decision}"
+        caption = f"Step {i+1}: {decision}"
         if 'class' in step_info:
             caption += f" (Class {step_info['class']})"
+        caption += f" | View: {view_size}x{view_size} | Pos: ({x},{y})"
 
-        draw_text.text((10, 10), caption, font=font, fill="white", stroke_width=1, stroke_fill="black")
+        # Разбиваем текст на несколько строк для лучшей читаемости
+        lines = caption.split(" | ")
+        for j, line in enumerate(lines):
+            draw_text.text((10, 10 + j*25), line, font=font, fill="white", stroke_width=2, stroke_fill="black")
         
         frames.append(frame)
 
@@ -997,10 +1121,10 @@ def create_episode_visualization(history_data, save_dir="visualizations"):
         
     # Save GIF
     timestamp = int(wandb.run.step)
-    save_path = os.path.join(save_dir, f"episode_{timestamp}.gif")
-    imageio.mimsave(save_path, frames, duration=0.5)
+    save_path = os.path.join(save_dir, f"step_by_step_{timestamp}.gif")
+    imageio.mimsave(save_path, frames, duration=1.0)  # Увеличиваем длительность кадра
     
-    return wandb.Image(save_path, caption=f"Episode at step {timestamp}")
+    return wandb.Image(save_path, caption=f"Step-by-step exploration at step {timestamp}")
 
 def save_checkpoint(agent, path="checkpoints/latest_checkpoint.pth"):
     """Saves the agent's state dictionary, overwriting the previous one."""
@@ -1037,11 +1161,57 @@ def visualize_and_checkpoint(agent, infos, step_count):
     if not history_to_log:
         return False
 
-    video = create_episode_visualization(history_to_log)
+    video = create_step_by_step_visualization(history_to_log)
     if video:
         wandb.log({"episode_visualization": video}, step=step_count)
     save_checkpoint(agent)
     return True
+
+def log_distribution_plot(mu, sigma, sample, name, step):
+    x = np.linspace(mu - 4*sigma, mu + 4*sigma, 200)
+    y = 1/(sigma * np.sqrt(2 * np.pi)) * np.exp(-0.5 * ((x - mu)/sigma)**2)
+    fig, ax = plt.subplots()
+    ax.plot(x, y, label=f'N({mu:.2f}, {sigma:.2f})')
+    ax.axvline(sample, color='red', linestyle='--', label=f'sample: {sample:.2f}')
+    ax.legend()
+    ax.set_title(name)
+    plt.tight_layout()
+    import wandb
+    wandb.log({f"{name}_distribution": wandb.Image(fig)}, step=step)
+    plt.close(fig)
+
+def log_class_histogram(logits, true_class, step):
+    import wandb
+    probs = np.exp(logits - np.max(logits))
+    probs = probs / probs.sum()
+    fig, ax = plt.subplots()
+    bars = ax.bar(np.arange(len(probs)), probs, color=['orange' if i==true_class else 'blue' for i in range(len(probs))])
+    ax.set_title('Class logits (orange = true class)')
+    ax.set_xlabel('Class')
+    ax.set_ylabel('Probability')
+    plt.tight_layout()
+    wandb.log({"class_histogram": wandb.Image(fig)}, step=step)
+    plt.close(fig)
+
+def log_action_histogram(is_move, is_zoom, step):
+    import wandb
+    fig, ax = plt.subplots()
+    bars = ax.bar(['move', 'zoom'], [int(is_move), int(is_zoom)], color=['orange' if is_move else 'blue', 'orange' if is_zoom else 'blue'])
+    ax.set_title('Chosen action (orange = chosen)')
+    plt.tight_layout()
+    wandb.log({"action_histogram": wandb.Image(fig)}, step=step)
+    plt.close(fig)
+
+def log_decision_histogram(decision_logit, step):
+    import wandb
+    p_classify = 1/(1+np.exp(-decision_logit))
+    p_explore = 1-p_classify
+    fig, ax = plt.subplots()
+    bars = ax.bar(['classify', 'explore'], [p_classify, p_explore], color=['blue', 'orange'])
+    ax.set_title('Decision logits (probabilities)')
+    plt.tight_layout()
+    wandb.log({"decision_histogram": wandb.Image(fig)}, step=step)
+    plt.close(fig)
 
 # ---------------- Entry point ------------------
 
@@ -1081,12 +1251,12 @@ if __name__ == '__main__':
     # --- Выберите одно из действий ---
 
     # 1. Чтобы запустить один эксперимент с настройками из CFG (ДЕЙСТВИЕ ПО УМОЛЧАНИЮ)
-    # main()
+    main()
 
     # 2. Чтобы создать новый sweep, раскомментируйте следующую строку:
-    sweep_id = wandb.sweep(sweep_config, project="cifar_active_sweep")
-    print(f"Created sweep with ID: {sweep_id}")
-    print(f"Sweep URL: https://wandb.ai/vladsteam/cifar_active_sweep/sweeps/{sweep_id}")
+    # sweep_id = wandb.sweep(sweep_config, project="cifar_active_sweep")
+    # print(f"Created sweep with ID: {sweep_id}")
+    # print(f"Sweep URL: https://wandb.ai/vladsteam/cifar_active_sweep/sweeps/{sweep_id}")
 
     # 3. Чтобы запустить sweep-агент, закомментируйте main() выше и раскомментируйте следующие строки:
     # sweep_id = "PASTE_YOUR_SWEEP_ID_HERE"  # <--- Вставьте сюда ID вашего sweep'а

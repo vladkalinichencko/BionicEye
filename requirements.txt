@@ -10,4 +10,4 @@ pandas
 tqdm
 Pillow
 imageio
-imageio-ffmpeg 
+imageio-ffmpeg
