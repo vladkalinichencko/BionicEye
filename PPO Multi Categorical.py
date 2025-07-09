@@ -11,99 +11,108 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
-from gym.vector import AsyncVectorEnv
+from gym.vector import SyncVectorEnv
 from torchvision import datasets
 from tqdm.auto import tqdm
 import cv2
+from gym import spaces
+import os
+
+import random
 
 class CIFAR10WindowEnv(gym.Env):
-    def __init__(self, data, labels, patch_size=8, max_steps=15):
+    def __init__(self, data, labels, patch_size=8, max_steps=15, log_file="agent_movement_log_3.log"):
         super().__init__()
         self.data = data
         self.labels = labels
         self.patch_size = patch_size
         self.max_steps = max_steps
-        # 4 movements + zoom in/out + 10 classes
-        self.action_space = gym.spaces.Discrete(4 + 2 + 10)
-        self.observation_space = gym.spaces.Box(
-            low=0.0, high=1.0,
-            shape=(3, patch_size, patch_size),
+        self.log_file = log_file
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, 'w') as log:
+                log.write("step, x, y, zoom, label, image_index\n")
+
+        self.action_space = spaces.MultiDiscrete([
+            2, 2, 2, 2,
+            2, 2,
+            10
+        ])
+
+        self.observation_space = spaces.Box(
+            0.0, 1.0,
+            shape=(6, patch_size, patch_size),
             dtype=np.float32
         )
+
         self.min_zoom = 1
         self.max_zoom = 4
-        self.zoom = 1
 
     def reset(self, *, seed=None, **kwargs):
         super().reset(seed=seed)
         idx = self.np_random.integers(len(self.data))
-        img = self.data[idx]
-        self.img = img.astype(np.uint8)
+        self.img = self.data[idx].astype(np.uint8)
         self.label = int(self.labels[idx])
-        self.x = (32 - self.patch_size) // 2
-        self.y = (32 - self.patch_size) // 2
-        self.steps = 0
+        self.image_index = idx
+
         self.zoom = 1
-        return self._get_patch(), {}
+        max_off = 32 - self.patch_size * self.zoom
+        self.x = self.np_random.integers(max_off)
+        self.y = self.np_random.integers(max_off)
+
+        self.steps = 0
+        return self._get_obs(), {}
 
     def step(self, action):
-        done = False
+        mv_up, mv_dn, mv_lf, mv_rt, zi, zo, cls = action
         reward = 0.0
-        info = {}
+        done = False
 
-        # classification
-        if action >= 6:
-            pred = action - 6
-            reward = 1.0 if pred == self.label else 0.0
-            done = True
-            return self._get_patch(), reward, done, False, info
-
-        # movements
-        if action == 0:
+        if mv_up:
             self.y = max(0, self.y - 1)
-        elif action == 1:
+        if mv_dn:
             self.y = min(32 - self.patch_size * self.zoom, self.y + 1)
-        elif action == 2:
+        if mv_lf:
             self.x = max(0, self.x - 1)
-        elif action == 3:
+        if mv_rt:
             self.x = min(32 - self.patch_size * self.zoom, self.x + 1)
-        # zoom in / zoom out
-        elif action == 4:
+
+        if zi:
             self.zoom = min(self.max_zoom, self.zoom * 2)
-        elif action == 5:
+        if zo:
             self.zoom = max(self.min_zoom, self.zoom // 2)
 
         self.steps += 1
         if self.steps >= self.max_steps:
-            flat = self._get_patch().reshape(-1)
-            pred = int(flat.argmax() % 10)
-            reward = 1.0 if pred == self.label else 0.0
+            reward = 1.0 if cls == self.label else 0.0
             done = True
 
-        return self._get_patch(), reward, done, False, info
+        self.log_step()
+        return self._get_obs(), reward, done, False, {}
+
+    def log_step(self):
+        with open(self.log_file, 'a') as log:
+            log.write(f"{self.steps}, {self.x}, {self.y}, {self.zoom}, {self.label}, {self.image_index}\n")
 
     def _get_patch(self):
         p = self.patch_size * self.zoom
-        patch = self.img[self.y:self.y+p, self.x:self.x+p, :]
-        patch = cv2.resize(patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_LINEAR)
-        patch = patch.transpose(2, 0, 1)  # HWC -> CHW
-        return patch.astype(np.float32) / 255.0
+        sub = self.img[self.y:self.y + p, self.x:self.x + p]
+        sub = cv2.resize(sub, (self.patch_size, self.patch_size), interpolation=cv2.INTER_LINEAR)
+        patch = sub.transpose(2, 0, 1).astype(np.float32) / 255.0
+        return patch
 
-    def render(self, mode="human", zoom_win: int = 4):
-        full = self.img.copy()
-        p = self.patch_size * self.zoom
-        x1, y1 = self.x, self.y
-        x2, y2 = x1 + p, y1 + p
-        cv2.rectangle(full, (x1, y1), (x2, y2), (0, 255, 0), 1)
-        patch = (self._get_patch().transpose(1, 2, 0) * 255).astype(np.uint8)
-        patch_zoom = cv2.resize(patch, (p * zoom_win, p * zoom_win), interpolation=cv2.INTER_NEAREST)
-        cv2.imshow("Full Image", cv2.cvtColor(full, cv2.COLOR_RGB2BGR))
-        cv2.imshow(f"Patch x{zoom_win}", cv2.cvtColor(patch_zoom, cv2.COLOR_RGB2BGR))
-        cv2.waitKey(1)
+    def _get_obs(self):
+        patch = self._get_patch()
+        H, W = self.patch_size, self.patch_size
+        max_off = 32 - self.patch_size * self.zoom
 
-    def close(self):
-        cv2.destroyAllWindows()
+        x_plane = np.full((1, H, W), self.x / max_off if max_off > 0 else 0, dtype=np.float32)
+        y_plane = np.full((1, H, W), self.y / max_off if max_off > 0 else 0, dtype=np.float32)
+        z_plane = np.full((1, H, W), (self.zoom - self.min_zoom) / (self.max_zoom - self.min_zoom), dtype=np.float32)
 
+        return np.concatenate([patch, x_plane, y_plane, z_plane], axis=0)
+
+def make_env(data, labels, patch_size, max_steps):
+    return CIFAR10WindowEnv(data, labels, patch_size, max_steps)
 
 train_ds = datasets.CIFAR10(root="./data", train=True, download=True)
 train_data = train_ds.data
@@ -113,48 +122,51 @@ test_ds = datasets.CIFAR10(root="./data", train=False, download=True)
 test_data = test_ds.data
 test_labels = np.array(test_ds.targets)
 
-n_envs = 16
+n_envs = 1024
 patch_size = 8
-max_steps = 40
-rollouts_per_env = 200
+max_steps = 20
+rollouts_per_env = 128
 total_steps = 100_000_000
-update_epochs = 4
-minibatch_size = 1024
-gamma = 0.99
+update_epochs = 8
+minibatch_size = 4096
+gamma = 0.97
 gae_lambda = 0.95
 clip_eps = 0.2
 policy_lr = 1e-4
 value_lr = 1e-4
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
 
+log_file = "agent_movement_log_3.log"
 train_env_fns = [
-    (lambda seed=1000 + i: lambda: CIFAR10WindowEnv(train_data, train_labels, patch_size, max_steps))()
-    for i in range(n_envs)
+    (lambda: CIFAR10WindowEnv(train_data, train_labels, patch_size, max_steps, log_file))
+    for _ in range(n_envs)
 ]
-train_envs = AsyncVectorEnv(train_env_fns)
+train_envs = SyncVectorEnv(train_env_fns)
+
 obs_shape = train_envs.single_observation_space.shape
-obs_dim = int(np.prod(obs_shape))
-act_dim = train_envs.single_action_space.n
+nvec = train_envs.single_action_space.nvec
+act_dim = int(nvec.sum())
 
 n_eval_envs = 8
 train_eval_fns = [
-    (lambda seed=2000 + i: lambda: CIFAR10WindowEnv(train_data, train_labels, patch_size, max_steps))()
-    for i in range(n_eval_envs)
+    (lambda: make_env(train_data, train_labels, patch_size, max_steps))
+    for _ in range(n_eval_envs)
 ]
-train_eval_envs = AsyncVectorEnv(train_eval_fns)
+train_eval_envs = SyncVectorEnv(train_eval_fns)
 
 test_eval_fns = [
-    (lambda seed=3000 + i: lambda: CIFAR10WindowEnv(test_data, test_labels, patch_size, max_steps))()
-    for i in range(n_eval_envs)
+    (lambda: make_env(test_data, test_labels, patch_size, max_steps))
+    for _ in range(n_eval_envs)
 ]
-test_eval_envs = AsyncVectorEnv(test_eval_fns)
+test_eval_envs = SyncVectorEnv(test_eval_fns)
 
 class RecurrentActorCritic(nn.Module):
-    def __init__(self, obs_shape, act_dim, hidden_size=256, lstm_layers=1):
+    def __init__(self, obs_shape, nvec, hidden_size=256, lstm_layers=1):
         super().__init__()
         C, H, W = obs_shape
+        self.nvec = nvec
         self.encoder = nn.Sequential(
             nn.Conv2d(C, 32, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -169,7 +181,7 @@ class RecurrentActorCritic(nn.Module):
             hidden_size=hidden_size,
             num_layers=lstm_layers
         )
-        self.policy = nn.Linear(hidden_size, act_dim)
+        self.policy = nn.Linear(hidden_size, int(nvec.sum()))
         self.value = nn.Linear(hidden_size, 1)
 
     def forward(self, x, hx, cx):
@@ -183,7 +195,25 @@ class RecurrentActorCritic(nn.Module):
         value = self.value(last).squeeze(-1)
         return logits, value, (hn, cn)
 
-model = RecurrentActorCritic(obs_shape, act_dim).to(device)
+class MultiCategorical:
+    def __init__(self, logits, nvec):
+        self.nvec = nvec
+        splits = torch.split(logits, nvec.tolist(), dim=-1)
+        self.dists = [Categorical(logits=s) for s in splits]
+
+    def sample(self):
+        samples = [d.sample() for d in self.dists]
+        return torch.stack(samples, dim=-1)
+
+    def log_prob(self, actions):
+        logps = [d.log_prob(actions[..., i]) for i, d in enumerate(self.dists)]
+        return torch.stack(logps, dim=-1).sum(dim=-1)
+
+    def entropy(self):
+        ents = [d.entropy() for d in self.dists]
+        return torch.stack(ents, dim=-1).sum(dim=-1)
+
+model = RecurrentActorCritic(obs_shape, nvec).to(device)
 optimizer = optim.Adam(model.parameters(), lr=policy_lr)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(
     optimizer,
@@ -210,7 +240,7 @@ def rollout(envs, model, rollouts):
         x_in = obs.unsqueeze(0)
         logits, vals, (hx, cx) = model(x_in, hx, cx)
 
-        dist = Categorical(logits=logits)
+        dist = MultiCategorical(logits, nvec)
         acts = dist.sample()
         logps = dist.log_prob(acts)
 
@@ -235,7 +265,6 @@ def rollout(envs, model, rollouts):
     _, last_vals, _ = model(x_in, hx, cx)
     return mb, last_vals
 
-
 def compute_gae(mb, last_vals, num_envs):
     mb_adv = []
     adv = torch.zeros(num_envs, device=device)
@@ -247,7 +276,6 @@ def compute_gae(mb, last_vals, num_envs):
         mb_adv.insert(0, adv)
     mb_ret = [a + v for a, v in zip(mb_adv, mb["vals"])]
     return mb_ret, mb_adv
-
 
 def evaluate_accuracy(envs, model, episodes=100):
     obs_np, _ = envs.reset()
@@ -265,7 +293,7 @@ def evaluate_accuracy(envs, model, episodes=100):
         with torch.no_grad():
             x_in = obs.unsqueeze(0)
             logits, _, (hx, cx) = model(x_in, hx, cx)
-            dist = Categorical(logits=logits)
+            dist = MultiCategorical(logits, nvec)
             acts = dist.sample()
         next_obs_np, rews, terms, truns, _ = envs.step(acts.cpu().numpy())
         done = terms | truns
@@ -280,6 +308,15 @@ def evaluate_accuracy(envs, model, episodes=100):
 
 steps = 0
 pbar = tqdm(total=total_steps, desc="PPO on CIFAR10")
+
+log_metrics_file = "P3_training_metrics.log"
+
+# Initialize the log file with headers if it does not exist
+if not os.path.exists(log_metrics_file):
+    with open(log_metrics_file, 'w') as log_file:
+        log_file.write("steps | policy_loss | value_loss | entropy | train_acc | test_acc\n")
+        
+entropy_coeffs = np.array([0.05, 0.05, 0.05, 0.05, 0.005, 0.005, 0.1])
 
 while steps < total_steps:
     mb, last_vals = rollout(train_envs, model, rollouts_per_env)
@@ -315,7 +352,7 @@ while steps < total_steps:
 
             x_in = o_mb.unsqueeze(0)
             logits, vals, _ = model(x_in, hx_mb, cx_mb)
-            dist = Categorical(logits=logits)
+            dist = MultiCategorical(logits, nvec)
 
             lp = dist.log_prob(a_mb)
             ratio = (lp - old_lp_mb).exp()
@@ -323,20 +360,28 @@ while steps < total_steps:
             loss_p = -torch.min(ratio * adv_mb,
                                 torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv_mb).mean()
             loss_v = (r_mb - vals).pow(2).mean()
-            loss_e = -dist.entropy().mean() * 0.01
+            entropy_vals = torch.stack([d.entropy() for d in dist.dists], dim=-1)
+            entropy_coeffs_tensor = torch.tensor(entropy_coeffs, device=device).float()
+            loss_e = -(entropy_vals * entropy_coeffs_tensor).mean()
+
             total_loss = loss_p + loss_v + loss_e
 
             optimizer.zero_grad()
             total_loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
 
     steps += train_envs.num_envs * rollouts_per_env
     pbar.update(train_envs.num_envs * rollouts_per_env)
 
-    train_acc = evaluate_accuracy(train_eval_envs, model, episodes=200)
-    test_acc = evaluate_accuracy(test_eval_envs, model, episodes=200)
+    train_acc = evaluate_accuracy(train_eval_envs, model, episodes=100)
+    test_acc = evaluate_accuracy(test_eval_envs, model, episodes=100)
+    # Log metrics to the .log file
+    with open(log_metrics_file, 'a') as log_file:
+        log_file.write(f"{steps} | {loss_p.item():.3f} | {loss_v.item():.3f} | "
+                       f"{dist.entropy().mean().item():.3f} | {train_acc * 100:.1f}% | "
+                       f"{test_acc * 100:.1f}%\n")
     pbar.set_postfix({
         "policy_loss": f"{loss_p.item():.3f}",
         "value_loss": f"{loss_v.item():.3f}",
