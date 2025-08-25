@@ -31,8 +31,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 logger = logging.getLogger(__name__)
 
 CFG = {
-    'env_steps': 100_000,  # полноценное обучение
-    'max_episode_steps': 50,  # меньше для ускорения
+    'env_steps': 10_000_000,  # полноценное обучение
+    'max_episode_steps': 20,  # эпизод ограничен 20 шагами
     'n_envs': 16,  # больше параллелизма для 4 V100
     'patch_size': 8,
     'd_model': 256,  # больше для лучшего качества
@@ -55,6 +55,8 @@ CFG = {
     'entropy_coef_decision': 0.0,
     'entropy_coef_actions': 0.0,
     'temperature': 0.3,  # уменьшил для более четких решений
+    'dropout': 0.1,  # dropout для регуляризации
+    'weight_decay': 1e-4,  # L2 регуляризация
 }
 
 sweep_config = {
@@ -246,15 +248,44 @@ class ViT(nn.Module):
         self.patch_emb = PatchEmbedding(in_ch, p_size, d_model, img_size)
         self.memory_transformer = MemoryTransformer(in_ch, p_size, d_model, img_size)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        enc_layer = nn.TransformerEncoderLayer(d_model, n_heads, dim_feedforward=4 * d_model, batch_first=True, norm_first=True)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model, n_heads, 
+            dim_feedforward=4 * d_model, 
+            batch_first=True, 
+            norm_first=True,
+            dropout=CFG.get('dropout', 0.1)
+        )
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
         # Heads
-        self.decision_head = nn.Linear(d_model, 1)
-        self.class_head    = nn.Linear(d_model, n_classes)
-        self.move_head     = nn.Sequential(nn.Linear(d_model, 2), AcceleratedTanh(0.8))
-        self.zoom_head     = nn.Sequential(nn.Linear(d_model, 1), AcceleratedTanh(0.8))
-        self.critic        = nn.Linear(d_model, 1)
-        self.decoder       = nn.Sequential(nn.Linear(d_model, 4*d_model), nn.ReLU(), nn.Linear(4*d_model, 3*p_size*p_size))
+        self.decision_head = nn.Sequential(
+            nn.Dropout(CFG.get('dropout', 0.1)),
+            nn.Linear(d_model, 1)
+        )
+        self.class_head    = nn.Sequential(
+            nn.Dropout(CFG.get('dropout', 0.1)),
+            nn.Linear(d_model, n_classes)
+        )
+        self.move_head     = nn.Sequential(
+            nn.Dropout(CFG.get('dropout', 0.1)),
+            nn.Linear(d_model, 2), 
+            AcceleratedTanh(0.8)
+        )
+        self.zoom_head     = nn.Sequential(
+            nn.Dropout(CFG.get('dropout', 0.1)),
+            nn.Linear(d_model, 1), 
+            AcceleratedTanh(0.8)
+        )
+        self.critic        = nn.Sequential(
+            nn.Dropout(CFG.get('dropout', 0.1)),
+            nn.Linear(d_model, 1)
+        )
+        self.decoder       = nn.Sequential(
+            nn.Dropout(CFG.get('dropout', 0.1)),
+            nn.Linear(d_model, 4*d_model), 
+            nn.ReLU(), 
+            nn.Dropout(CFG.get('dropout', 0.1)),
+            nn.Linear(4*d_model, 3*p_size*p_size)
+        )
 
     def forward(self, x: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor, sz: torch.Tensor):
         B = x.shape[0]
@@ -298,7 +329,7 @@ class ViT(nn.Module):
 
 class HybridActionDist:
     """Bernoulli (decision) + Categorical (class) + Gaussians (move, zoom)."""
-    def __init__(self, params: dict):
+    def __init__(self, params: dict, is_eval: bool = False):
         # --- Decision branch ---
         p_raw = torch.sigmoid(params['decision_logit'].clamp(-10.0, 10.0))
         if not torch.isfinite(p_raw).all():
@@ -465,26 +496,35 @@ class CIFAREnv(gymnasium.Env):
         cfg = wandb.config
         self.steps += 1
         reward = 0.0
-        done = False
         info = {}
 
         decision = int(action['decision'])
-        if decision == 1:  # classify now
+        terminated = False  # будем завершать эпизод вручную
+        truncated = False   # больше не используем тайм-аут по шагам
+
+        if decision == 1:  # classify now – завершаем эпизод
             pred_class = int(action['class'])
             if pred_class == self.label:
                 reward = cfg.correct_bonus
-            
-            # Убираем done = True - позволяем агенту продолжать исследование
-            
-            # Log action for visualization
-            self.history.append({'decision': 1, 'class': pred_class, 'view_size': self.cur_view_size, 'x': self.x, 'y': self.y})
+            terminated = True  # ключевое изменение
+
+            # Log action for visualization (добавили reward)
+            self.history.append({
+                'decision': 1,
+                'class': pred_class,
+                'view_size': self.cur_view_size,
+                'x': self.x,
+                'y': self.y,
+                'reward': reward,
+                'true_class': self.label,  # добавили реальный класс
+            })
         else:
             # continue exploring: use move & zoom
             x_norm_raw, y_norm_raw = action['move']
             x_norm = np.clip(x_norm_raw, 0.0, 1.0)
             y_norm = np.clip(y_norm_raw, 0.0, 1.0)
 
-            zoom_norm_action = float(action['zoom']) # now in [0,1]
+            zoom_norm_action = float(action['zoom'])  # now in [0,1]
             z_factor = 1.0 + (self.z_max - 1.0) * zoom_norm_action
             
             view_size = int(round(self.img_hw / z_factor))
@@ -499,8 +539,14 @@ class CIFAREnv(gymnasium.Env):
             self.x, self.y = x0, y0
             self.cur_view_size = view_size
             
-            # Log action for visualization
-            self.history.append({'decision': 0, 'view_size': view_size, 'x': x0, 'y': y0})
+            # Log action for visualization (добавили reward)
+            self.history.append({
+                'decision': 0,
+                'view_size': view_size,
+                'x': x0,
+                'y': y0,
+                'reward': reward,
+            })
 
         obs = self._get_patch()
         cx, cy, sz = self.get_patch_coords()
@@ -509,7 +555,7 @@ class CIFAREnv(gymnasium.Env):
         self.cx_history.append(cx)
         self.cy_history.append(cy)
         self.sz_history.append(sz)
-        
+
         # Добавляем информацию о текущем состоянии для анализа
         info['step'] = self.steps
         info['current_pos'] = (self.x, self.y)
@@ -519,13 +565,16 @@ class CIFAREnv(gymnasium.Env):
             info['predicted_class'] = int(action['class'])
             info['true_class'] = self.label
             info['correct'] = (int(action['class']) == self.label)
-        
-        truncated = (self.steps >= self.max_steps)
-        
-        if truncated: # if done or truncated:
+
+        # Если эпизод не завершён, проверяем ограничение по шагам
+        if not terminated and self.steps >= self.max_steps:
+            truncated = True
+
+        # Если эпизод завершён, прикладываем историю (history уже содержит reward)
+        if terminated or truncated:
             info['episode_history'] = self.history
 
-        return obs, reward, False, truncated, info
+        return obs, reward, terminated, truncated, info
 
     def get_patch_coords(self):
         # Центр текущего патча (x, y) и масштаб (z)
@@ -572,15 +621,23 @@ def get_batch_history(envs):
     sz_batch = np.stack([pad(s, (max_T,)) for s in sz_list], axis=0)
     return obs_batch, cx_batch, cy_batch, sz_batch
 
-def evaluate_on_test_set(agent, n_episodes=100):
-    """Evaluate agent on test set without training."""
+def evaluate_on_test_set(agent, n_episodes=100, verbose=False):
+    """Evaluate agent on test set without training.
+
+    If verbose=True, prints how many episodes ended with classification and
+    basic accuracy statistics to facilitate debugging.
+    """
     # Create test environments
     test_envs = SyncVectorEnv([lambda: CIFAREnv(test_images, test_targets, CFG['patch_size'], CFG['max_episode_steps'], _ds.test.n_classes) for _ in range(min(CFG['n_envs'], 8))])
     
     agent.eval()
     total_rewards = []
-    total_accuracies = []
     total_episode_lengths = []
+
+    cls_total = 0   # сколько раз классифицировали
+    cls_correct = 0 # сколько из них верны
+    step_total = 0  # общее число шагов (кроме нулевого)
+    step_correct = 0
     
     episodes_done = 0
     obs_batch, _ = test_envs.reset()
@@ -615,39 +672,52 @@ def evaluate_on_test_set(agent, n_episodes=100):
         for i, done in enumerate(dones):
             if done and episodes_done < n_episodes:
                 # Extract episode info - более безопасная проверка
-                try:
-                    if (infos and isinstance(infos, (list, tuple)) and len(infos) > i and 
-                        infos[i] and isinstance(infos[i], dict) and 'episode_history' in infos[i]):
-                        history = infos[i]['episode_history']
-                        episode_reward = sum([step.get('reward', 0) for step in history[1:]])  # Skip first entry
-                        episode_length = len(history) - 1
-                        
-                        # Check if final decision was correct
-                        final_step = history[-1]
-                        if final_step.get('decision') == 1:
-                            pred_class = final_step.get('class', -1)
-                            true_label = test_targets[episodes_done % len(test_targets)]
-                            accuracy = 1.0 if pred_class == true_label else 0.0
-                        else:
-                            accuracy = 0.0  # Didn't classify
-                        
-                        total_rewards.append(episode_reward)
-                        total_accuracies.append(accuracy)
-                        total_episode_lengths.append(episode_length)
-                        episodes_done += 1
+                history_available = (infos and isinstance(infos, (list, tuple)) and len(infos) > i and 
+                                             infos[i] and isinstance(infos[i], dict) and 'episode_history' in infos[i])
+                if history_available:
+                    history = infos[i]['episode_history']
+                    episode_reward = sum([step.get('reward', 0) for step in history[1:]])  # Skip first entry
+                    episode_length = len(history) - 1
+                    
+                    # Check if final decision was correct
+                    final_step = history[-1]
+                    if final_step.get('decision') == 1:
+                        pred_class = final_step.get('class', -1)
+                        true_label = final_step.get('true_class', -1)  # берем из истории
+                        accuracy = 1.0 if pred_class == true_label else 0.0
+                        cls_correct += accuracy
+                        cls_total += 1
                     else:
-                        # Если нет истории эпизода, используем дефолтные значения
-                        total_rewards.append(0.0)
-                        total_accuracies.append(0.0)
-                        total_episode_lengths.append(1.0)
-                        episodes_done += 1
-                except Exception as e:
-                    logger.warning(f"Error processing episode info: {e}")
-                    # Fallback values
-                    total_rewards.append(0.0)
-                    total_accuracies.append(0.0)
-                    total_episode_lengths.append(1.0)
-                    episodes_done += 1
+                        # не было классификации в истории – отложим, решим ниже
+                        accuracy = None
+                else:
+                    # Если нет истории эпизода, используем дефолтные значения
+                    history = None
+                    episode_reward = 0.0
+                    episode_length = 1.0
+                    accuracy = None
+
+                # Если accuracy ещё не вычислена (нет классификации) – делаем forced argmax
+                if accuracy is None:
+                    # берём предсказание из последних logits
+                    forced_pred = int(params['class_logits'][i].argmax().item())
+                    true_label = test_envs.envs[i].label
+                    accuracy = 1.0 if forced_pred == true_label else 0.0
+                    cls_correct += accuracy
+                    cls_total += 1
+
+                # step totals
+                step_total += episode_length
+                step_correct += accuracy  # accuracy is 1 or 0
+
+                total_rewards.append(episode_reward)
+                total_episode_lengths.append(episode_length)
+                episodes_done += 1
+            else:
+                # Если нет истории эпизода, используем дефолтные значения
+                total_rewards.append(0.0)
+                total_episode_lengths.append(1.0)
+                episodes_done += 1
                     
     if steps_taken >= max_steps:
         logger.warning(f"Test evaluation timeout after {steps_taken} steps, got {episodes_done} episodes")
@@ -664,12 +734,20 @@ def evaluate_on_test_set(agent, n_episodes=100):
             'test_episodes': 0
         }
     
-    return {
-        'test_accuracy': np.mean(total_accuracies),
+    class_acc = cls_correct / max(cls_total, 1)
+    step_acc = step_correct / max(step_total, 1)
+    results = {
+        'val_class_accuracy': class_acc,
+        'val_step_accuracy': step_acc,
         'test_avg_return': np.mean(total_rewards),
         'test_avg_length': np.mean(total_episode_lengths),
         'test_episodes': len(total_rewards)
     }
+
+    if verbose:
+        print(f"[EVAL DEBUG] Episodes: {len(total_rewards)} | Classifications attempted: {cls_total} | ClassAcc: {class_acc:.3f} | StepAcc: {step_acc:.3f}")
+
+    return results
 
 def make_env(seed):
     def thunk():
@@ -743,7 +821,11 @@ def log_tsne_embeddings(tokens, step):
 
 def train_ppo(agent):
     cfg = wandb.config
-    opt = optim.AdamW(agent.parameters(), lr=cfg.lr)
+    opt = optim.AdamW(
+        agent.parameters(), 
+        lr=cfg.lr,
+        weight_decay=CFG.get('weight_decay', 1e-4)
+    )
     buf = {k: [] for k in ['obs', 'cx', 'cy', 'sz', 'act', 'logp', 'val', 'rew', 'done']} # Добавляем координаты
     step_count, ep_count = 0, 0
     ep_rewards, ep_lengths = [], []
@@ -760,7 +842,6 @@ def train_ppo(agent):
     external_rewards = []
 
     while step_count < CFG['env_steps']:
-        print(f"DEBUG: step_count at loop start = {step_count}")
         #rollout
         for _ in range(cfg.rollout_length):
             # --- Получаем всю историю для каждого env ---
@@ -910,7 +991,9 @@ def train_ppo(agent):
         for k in buf: buf[k].clear()
         
         tot_pl, tot_vl, tot_ent, cnt, tot_rec = 0,0,0,0,0
-        correct_predictions = 0
+        correct_step = 0      # правильные предсказания на всех шагах
+        cls_total = 0          # сколько раз классифицировали
+        cls_correct = 0        # сколько раз верно классифицировали
         
         for _ in range(cfg.update_epochs):
             perm = torch.randperm(len(obs_f))
@@ -965,13 +1048,18 @@ def train_ppo(agent):
                 cnt += 1
 
                 pred_classes = params_b['class_logits'].argmax(dim=-1)
-                correct_predictions += ((b_decision==1) & (pred_classes==b_class)).sum().item()
+                is_cls = (b_decision == 1)
+                step_correct = (is_cls & (pred_classes == b_class)).sum()
+                correct_step += step_correct.item()
+                cls_correct += step_correct.item()
+                cls_total += is_cls.sum().item()
         
         avg_pl = tot_pl / cnt
         avg_vl = tot_vl / cnt
         avg_ent = tot_ent / cnt
         avg_rec = tot_rec / cnt
-        accuracy = correct_predictions / (len(obs_f) * cfg.update_epochs)
+        step_accuracy = correct_step / (len(obs_f) * cfg.update_epochs)
+        class_accuracy = cls_correct / max(cls_total, 1)
 
         # Log detailed reward breakdown every 1000 steps
         if step_count % 1000 == 0 and external_rewards:
@@ -987,12 +1075,13 @@ def train_ppo(agent):
         val_results = evaluate_on_test_set(agent, n_episodes=n_val_episodes)
         print(f"DEBUG: Validation results: {val_results}")
         wandb.log({
-            "validation/accuracy": val_results['test_accuracy'],
+            "validation/class_accuracy": val_results['val_class_accuracy'],
+            "validation/step_accuracy": val_results['val_step_accuracy'],
             "validation/avg_return": val_results['test_avg_return'],
             "validation/avg_length": val_results['test_avg_length'],
             "validation/episodes": val_results['test_episodes']
         }, step=step_count)
-        logger.info(f"Validation at step {step_count}: Accuracy={val_results['test_accuracy']:.3f}, Return={val_results['test_avg_return']:.3f}")
+        logger.info(f"Validation at step {step_count}: ClassAcc={val_results['val_class_accuracy']:.3f}, StepAcc={val_results['val_step_accuracy']:.3f}, Return={val_results['test_avg_return']:.3f}")
         print(f"DEBUG: Logged validation to wandb at step {step_count}")
 
         # Вычисляем реальные значения энтропии для логирования
@@ -1010,7 +1099,8 @@ def train_ppo(agent):
             "training/entropy_classification_value": ent_classification_val.mean().item(),  # реальные значения
             "training/entropy_decision_coef": cfg.entropy_coef,  # коэффициенты для справки
             "training/entropy_classification_coef": cfg.entropy_coef_classification,
-            "training/accuracy": accuracy,
+            "training/step_accuracy": step_accuracy,
+            "training/class_accuracy": class_accuracy,
             "training/recon_loss": avg_rec,
         }, step=step_count)
 
@@ -1029,14 +1119,16 @@ def train_ppo(agent):
     logger.info("Running final test set evaluation...")
     final_test_results = evaluate_on_test_set(agent, n_episodes=20)  # быстрая проверка
     wandb.log({
-        "final_test_accuracy": final_test_results['test_accuracy'],
+        "final_test_class_accuracy": final_test_results['val_class_accuracy'],
+        "final_test_step_accuracy": final_test_results['val_step_accuracy'],
         "final_test_avg_return": final_test_results['test_avg_return'],
         "final_test_avg_length": final_test_results['test_avg_length']
     }, step=step_count)
     
     # Detailed reward analysis
     logger.info(f"Final Test Results:")
-    logger.info(f"  Accuracy: {final_test_results['test_accuracy']:.3f}")
+    logger.info(f"  Class Accuracy: {final_test_results['val_class_accuracy']:.3f}")
+    logger.info(f"  Step Accuracy: {final_test_results['val_step_accuracy']:.3f}")
     logger.info(f"  Avg Return: {final_test_results['test_avg_return']:.3f}")
     logger.info(f"  Avg Episode Length: {final_test_results['test_avg_length']:.1f}")
     
