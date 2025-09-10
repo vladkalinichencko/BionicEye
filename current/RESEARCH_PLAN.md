@@ -14,7 +14,7 @@ This project explores Active Vision through three progressively stronger baselin
 - Baseline 3: RL-driven patch movement (Active Vision)
   - Agent learns to move/scale a glimpse window to maximize representation quality or classification accuracy in few steps
   - Start with simple PPO; reuse utilities from `previous/` as inspiration
-
+  
 ## Hierarchical roadmap
 
 - Phase A: Classification with global encoding (TinyImageNet half-classes)

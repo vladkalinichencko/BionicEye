@@ -1,7 +1,6 @@
 numpy
 torch
 torchvision
-wandb
 imageio
 einops
 matplotlib
@@ -10,3 +9,5 @@ gymnasium
 Pillow
 tqdm
 opencv-python
+datasets
+clearml
