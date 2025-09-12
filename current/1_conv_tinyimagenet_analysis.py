@@ -1,8 +1,8 @@
 """Strict analysis over Optuna + ClearML (minimal, self‑contained).
 
-For each Optuna trial, we fetch the LAST reported ClearML metric values and plot slice-like
-per-parameter charts. Objective is strictly the LAST `val_loss` (lower is better).
-We also fetch the LAST `val_acc` and keep it in the dataframe for reference.
+For each Optuna trial, we fetch the Last reported ClearML metric values and plot slice-like
+per-parameter charts. Objective is strictly the Last `val_loss` (lower is better).
+We also fetch the Last `val_acc` and keep it in the dataframe for reference.
 
 Visual style:
 - Points: light blue.
@@ -23,8 +23,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 STUDY = os.environ.get('STUDY', 'tiny_imagenet_sweep')
 DB = os.environ.get('DB', os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'sweep.db')))
 PROJECT = os.environ.get('CLEARML_PROJECT', 'BionicEye')
-OBJ = 'val_loss'  # main objective: strictly use LAST val_loss
-ACC = 'val_acc'   # also fetch LAST val_acc for reference
+OBJ = 'val_loss'  # main objective: strictly use Last val_loss
+ACC = 'val_acc'   # also fetch Last val_acc for reference
 SYNC_FROM_CLEARML = os.environ.get('SYNC_FROM_CLEARML', '0') in ('1', 'true', 'True')
 # Optional: after fetching from ClearML, persist into Optuna user-attrs via JSON API only.
 SAVE_TO_OPTUNA = os.environ.get('SAVE_TO_OPTUNA', '0') in ('1', 'true', 'True')
@@ -286,7 +286,19 @@ def main():
                         x=[x_min, x_max],
                         y=[m, m],
                         mode='lines',
-                        line=dict(color='rgba(220,30,30,0.95)', width=1.5),
+                        line=dict(color='rgba(220,30,30,0.95)', width=1.0),
+                        hoverinfo='skip',
+                        showlegend=False,
+                    ),
+                    row=i, col=1,
+                )
+                # Mean point at the category column to show origin
+                fig.add_trace(
+                    go.Scatter(
+                        x=[k],
+                        y=[m],
+                        mode='markers',
+                        marker=dict(color='rgba(220,30,30,0.95)', size=6),
                         hoverinfo='skip',
                         showlegend=False,
                     ),
@@ -329,8 +341,8 @@ def main():
                                       line=dict(color='rgba(200,80,60,0.95)', width=1), row=i, col=1)
 
     # Taller subplots for readability (approx square/tall panels)
-    per_panel = int(os.environ.get('PANEL_HEIGHT', '320'))
-    layout_kwargs = dict(height=max(700, per_panel * n), width=int(os.environ.get('FIG_WIDTH', '1000')), showlegend=False, title=f"{STUDY} — LAST {OBJ}")
+    per_panel = int(os.environ.get('PANEL_HEIGHT', '500'))
+    layout_kwargs = dict(height=max(700, per_panel * n), width=int(os.environ.get('FIG_WIDTH', '1000')), showlegend=False, title=f"{STUDY} — Last {OBJ}")
     # Optional log-scale for y
     if os.environ.get('Y_LOG', '0') in ('1', 'true', 'True'):
         layout_kwargs['yaxis_type'] = 'log'

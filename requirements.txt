@@ -11,3 +11,4 @@ tqdm
 opencv-python
 datasets
 clearml
+plotly

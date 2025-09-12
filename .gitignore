@@ -9,3 +9,7 @@ visualizations/
 wandb/
 data/
 cifar10.npz 
+## Sweep DB files
+sweep.db
+sweep.db-shm
+sweep.db-wal

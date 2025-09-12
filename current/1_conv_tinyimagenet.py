@@ -58,6 +58,10 @@ class _IdentityTfm:
     def __call__(self, x):
         return x
 
+class ToRGB:
+    def __call__(self, img):
+        return img.convert('RGB')
+
 class TinyImageNetTorch(Dataset):
     def __init__(self, hf_dataset, transform=None):
         self.data = hf_dataset
@@ -169,9 +173,82 @@ class ViTEncoder(nn.Module):
         patches = patches.view(patches.size(0), -1, self.patch_size * self.patch_size * 3)
         return patches
 
+# ------------------------------
+# Minimal ResNet-like encoder (our own copy)
+# CIFAR-style stem (3x3 s=1) + 4 stages with residual blocks (2-2-2-2).
+# ------------------------------
+
+def _conv3x3(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, in_planes, planes, stride=1):
+        super().__init__()
+        self.conv1 = _conv3x3(in_planes, planes, stride)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = _conv3x3(planes, planes, 1)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = None
+        if stride != 1 or in_planes != planes * self.expansion:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_planes, planes * self.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * self.expansion),
+            )
+
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out = self.relu(out + identity)
+        return out
+
+
+class ResNetEncoder(nn.Module):
+    def __init__(self, layers_cfg=(2,2,2,2), width: float = 1.0, input_channels: int = 3):
+        super().__init__()
+        c1, c2, c3, c4 = [int(v * width) for v in (64, 128, 256, 512)]
+        # CIFAR stem: keep stride=1 at input resolution 64x64
+        self.stem = nn.Sequential(
+            nn.Conv2d(input_channels, c1, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.ReLU(inplace=True),
+        )
+        self.inplanes = c1
+        self.layer1 = self._make_layer(BasicBlock, c1, layers_cfg[0], stride=1)
+        self.layer2 = self._make_layer(BasicBlock, c2, layers_cfg[1], stride=2)  # downsample x2
+        self.layer3 = self._make_layer(BasicBlock, c3, layers_cfg[2], stride=2)  # downsample x2
+        self.layer4 = self._make_layer(BasicBlock, c4, layers_cfg[3], stride=2)  # downsample x2
+        last_dim = c4 * BasicBlock.expansion
+
+        self.features = nn.Sequential(self.stem, self.layer1, self.layer2, self.layer3, self.layer4)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.final_proj = nn.Linear(last_dim, LATENT_DIM)
+
+    def _make_layer(self, block, planes, blocks, stride):
+        layers = [block(self.inplanes, planes, stride)]
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes, 1))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
+        return self.final_proj(x)
+
 def encoder(encoder_type, input_channels=3, conv_depth=4, residual=False):
     if encoder_type == 'conv':
-        return ConvEncoder(input_channels=input_channels, conv_depth=conv_depth, residual=residual)
+        # Our own residual CNN with a classic 2-2-2-2 layout (no variants)
+        return ResNetEncoder(layers_cfg=(2, 2, 2, 2), input_channels=input_channels)
     elif encoder_type == 'vit':
         return ViTEncoder(input_channels)
 
@@ -229,7 +306,7 @@ def get_dataset(split):
     ])
 
     valid_tfms = transforms.Compose([
-        transforms.Lambda(lambda img: img.convert('RGB')),
+        ToRGB(),
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean.tolist(), std=std.tolist()),
@@ -257,6 +334,8 @@ def train(model, train_loader, val_loader, optimizer, criterion, logger=None, ch
         total_loss = 0
         correct = 0
         total = 0
+        if monitor:
+            monitor.begin_validation()
 
         with torch.no_grad():
             for x, y in loader:
@@ -269,6 +348,9 @@ def train(model, train_loader, val_loader, optimizer, criterion, logger=None, ch
                 pred = logits.argmax(dim=1)
                 correct += (pred == y).sum().item()
                 total += bs
+                # confusion matrix update delegated
+                if monitor:
+                    monitor.update_confusion_batch(pred, y)
         
         return total_loss / total, correct / total
 
@@ -287,6 +369,8 @@ def train(model, train_loader, val_loader, optimizer, criterion, logger=None, ch
             x = x.to(DEVICE, non_blocking=True)
             y = y.to(DEVICE, non_blocking=True)
             optimizer.zero_grad()
+            if monitor:
+                monitor.before_step(model)
             logits = model(x)
             loss = criterion(logits, y)
             loss.backward()
@@ -302,6 +386,19 @@ def train(model, train_loader, val_loader, optimizer, criterion, logger=None, ch
             running_total += bs
             global_step += 1
 
+            # batch-level metrics
+            batch_acc = (preds == y).float().mean().item()
+            if monitor:
+                monitor.log_step(
+                    model=model,
+                    epoch=epoch,
+                    step=global_step,
+                    batch_loss=float(loss.item()),
+                    batch_acc=float(batch_acc),
+                    lr=float(optimizer.param_groups[0]['lr']),
+                    grad_norm=float(total_grad_norm.item() if hasattr(total_grad_norm, 'item') else float(total_grad_norm)),
+                )
+
             if logger and global_step % LOG_INTERVAL == 0:
                 acc = running_correct / running_total
                 logger.report_scalar("train_loss", "step", value=running_loss / running_total, iteration=global_step)
@@ -314,6 +411,8 @@ def train(model, train_loader, val_loader, optimizer, criterion, logger=None, ch
                 if logger:
                     logger.report_scalar("val_loss", "step", value=val_loss, iteration=global_step)
                     logger.report_scalar("val_acc", "step", value=val_acc, iteration=global_step)
+                if monitor:
+                    monitor.end_validation(step=global_step, val_loss=float(val_loss), val_acc=float(val_acc))
                 
                 print(f"Epoch {epoch} | [Validation at step {global_step}] Val loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
                 if val_acc > best_val:
