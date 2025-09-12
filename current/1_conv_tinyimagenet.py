@@ -19,27 +19,40 @@ from clearml import Task
 import optuna
 from optuna.storages import RDBStorage
 import gc
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 
 LATENT_DIM = 512
 NUM_CLASSES = 100
 IMAGE_SIZE = 64
-EPOCHS = 10
+EPOCHS = 60
 VAL_INTERVAL = 100
 LOG_INTERVAL = 10
 DEVICE = torch.device('mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu'))
 
+# ClearML defaults (override via env or function params)
+CLEARML_PROJECT = os.environ.get('CLEARML_PROJECT', 'BionicEye')
+SWEEP_EXPERIMENT_BASE = os.environ.get('SWEEP_EXPERIMENT_BASE', 'Tiny ImageNet Sweep (optuna)')
+FIXED_EXPERIMENT_NAME = os.environ.get('FIXED_EXPERIMENT_NAME', 'Tiny ImageNet Final')
+
 HPARAMS = {
     'encoder': 'conv',
-    'batch_size': 128,
-    'learning_rate': 1e-3,
+    'batch_size': 160,
+    'learning_rate': 3e-3,
     'weight_decay': 1e-4,
-    'dropout': 0.3,
-    'conv_depth': 4,
+    'dropout': 0.2,
+    'conv_depth': 5,
     'head_depth': 2,
-    'use_autoaugment': True,
+    'use_autoaugment': False,
+    # lighter augmentation knobs
+    'crop_scale_min': 0.8,
+    'erasing_p': 0.1,
     'label_smoothing': 0.1,
-    'residual': False,
+    'residual': True,
 }
+
+# Cache for normalization stats computed on train split once
+TRAIN_MEAN_STD = None
 
 class _IdentityTfm:
     def __call__(self, x):
@@ -196,17 +209,23 @@ def get_dataset(split):
 
         return mean.numpy(), std.numpy()
     
+    # compute train stats once and reuse for valid/test
+    global TRAIN_MEAN_STD
+    if TRAIN_MEAN_STD is None:
+        train_raw = load_tinyimagenet('train')
+        TRAIN_MEAN_STD = compute_statistics(train_raw)
+    mean, std = TRAIN_MEAN_STD
+
     raw_dataset = load_tinyimagenet(split)
-    mean, std = compute_statistics(raw_dataset)
 
     train_tfms = transforms.Compose([
         transforms.Lambda(lambda img: img.convert('RGB')),
-        transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.6, 1.0)),
+        transforms.RandomResizedCrop(IMAGE_SIZE, scale=(HPARAMS.get('crop_scale_min', 0.8), 1.0)),
         transforms.RandomHorizontalFlip(),
         AutoAugment(AutoAugmentPolicy.IMAGENET) if HPARAMS['use_autoaugment'] else _IdentityTfm(),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean.tolist(), std=std.tolist()),
-        transforms.RandomErasing(p=0.25, scale=(0.02, 0.2), value='random'),
+        transforms.RandomErasing(p=HPARAMS.get('erasing_p', 0.1), scale=(0.02, 0.1), value='random'),
     ])
 
     valid_tfms = transforms.Compose([
@@ -219,7 +238,20 @@ def get_dataset(split):
     tfms = train_tfms if split == 'train' else valid_tfms
     return TinyImageNetTorch(raw_dataset, transform=tfms)
 
-def train(model, train_loader, val_loader, optimizer, criterion, logger=None):
+def _build_cosine_warmup(optimizer, total_steps: int, warmup_ratio: float = 0.1, min_lr_scale: float = 0.01):
+    warmup_steps = max(1, int(total_steps * warmup_ratio))
+    def lr_lambda(step: int):
+        if step < warmup_steps:
+            return float(step + 1) / float(warmup_steps)
+        rem = max(1, total_steps - warmup_steps)
+        progress = float(step - warmup_steps) / float(rem)
+        # cosine from 1.0 to min_lr_scale
+        cosine = 0.5 * (1.0 + np.cos(np.pi * min(1.0, max(0.0, progress))))
+        return min_lr_scale + (1.0 - min_lr_scale) * cosine
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def train(model, train_loader, val_loader, optimizer, criterion, logger=None, checkpoint_path: str = None):
     def validate(model, loader, criterion):
         model.eval()
         total_loss = 0
@@ -244,6 +276,9 @@ def train(model, train_loader, val_loader, optimizer, criterion, logger=None):
     best_val = 0.0
     global_step = 0
 
+    total_steps = EPOCHS * max(1, len(train_loader))
+    scheduler = _build_cosine_warmup(optimizer, total_steps, warmup_ratio=0.1, min_lr_scale=0.01)
+
     for epoch in range(EPOCHS):
         model.train()
         running_loss, running_correct, running_total = 0.0, 0, 0
@@ -255,7 +290,10 @@ def train(model, train_loader, val_loader, optimizer, criterion, logger=None):
             logits = model(x)
             loss = criterion(logits, y)
             loss.backward()
+            # optional: gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
             
             bs = x.size(0)
             running_loss += loss.item() * bs
@@ -268,6 +306,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, logger=None):
                 acc = running_correct / running_total
                 logger.report_scalar("train_loss", "step", value=running_loss / running_total, iteration=global_step)
                 logger.report_scalar("train_acc", "step", value=acc, iteration=global_step)
+                logger.report_scalar("lr", "step", value=optimizer.param_groups[0]['lr'], iteration=global_step)
                 print(f"Epoch {epoch} | Step {global_step}: Train loss: {running_loss/running_total:.4f}, Acc: {acc:.4f}")
 
             if global_step % VAL_INTERVAL == 0:
@@ -279,6 +318,8 @@ def train(model, train_loader, val_loader, optimizer, criterion, logger=None):
                 print(f"Epoch {epoch} | [Validation at step {global_step}] Val loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
                 if val_acc > best_val:
                     best_val = val_acc
+                    if checkpoint_path:
+                        save_checkpoint(model, checkpoint_path, extra={"best_val_acc": best_val, "global_step": global_step})
 
     return best_val
 
@@ -291,8 +332,6 @@ def _free_memory():
     except Exception:
         pass
     gc.collect()
-
-# ---- Optuna objective & launcher (parallel-friendly via SQLite) ----
 
 def objective(trial: optuna.trial.Trial) -> float:
     hp = {
@@ -308,7 +347,6 @@ def objective(trial: optuna.trial.Trial) -> float:
         'residual': trial.suggest_categorical('residual', [True, False]),
     }
 
-    # apply HPs
     global HPARAMS, BATCH_SIZE, LEARNING_RATE, WEIGHT_DECAY, DROPOUT_P
     HPARAMS = hp
     BATCH_SIZE = hp['batch_size']
@@ -316,30 +354,26 @@ def objective(trial: optuna.trial.Trial) -> float:
     WEIGHT_DECAY = hp['weight_decay']
     DROPOUT_P = hp['dropout']
 
-    # clearml task per trial (for nice Scalars graphs)
-    trial_task = Task.init(project_name="BionicEye", task_name=f"Tiny ImageNet Sweep (optuna) / trial_{trial.number:04d}", reuse_last_task_id=False)
+    trial_task = Task.init(project_name=CLEARML_PROJECT, task_name=f"{SWEEP_EXPERIMENT_BASE} / trial_{trial.number:04d}", reuse_last_task_id=False)
     trial_logger = trial_task.get_logger()
     trial_task.connect(HPARAMS, name='HPARAMS')
 
-    # data & loaders
     train_data = get_dataset('train')
     val_data = get_dataset('valid')
-    train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=4, pin_memory=(DEVICE.type=='cuda'))
+    val_loader = DataLoader(val_data, batch_size=BATCH_SIZE, shuffle=False,
+                            num_workers=4, pin_memory=(DEVICE.type=='cuda'))
 
-    # model
     enc = encoder(HPARAMS['encoder'], conv_depth=HPARAMS['conv_depth'], residual=HPARAMS['residual'])
     clf = classifier_head(head_depth=HPARAMS['head_depth'])
     model = nn.Sequential(enc, clf).to(DEVICE)
 
-    # optim & loss
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     criterion = nn.CrossEntropyLoss(label_smoothing=HPARAMS['label_smoothing'])
 
-    # train & return best val acc
     best = train(model, train_loader, val_loader, optimizer, criterion, trial_logger)
 
-    # cleanup to avoid device/loader locks between trials
     del model, enc, clf, optimizer, criterion
     del train_loader, val_loader, train_data, val_data
     _free_memory()
@@ -348,12 +382,264 @@ def objective(trial: optuna.trial.Trial) -> float:
     trial_task.close()
     return best
 
-if __name__ == '__main__':
+
+def save_checkpoint(model: nn.Module, path: str, extra: dict = None) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {"state_dict": model.state_dict()}
+    if extra is not None:
+        payload.update(extra)
+    torch.save(payload, path)
+
+
+def _to_uint8_rgb(img3chw: torch.Tensor) -> np.ndarray:
+    x = img3chw.detach().cpu()
+    x = (x - x.min()) / (x.max() - x.min() + 1e-6)
+    x = (x * 255.0).clamp(0, 255).byte().numpy()
+    return np.transpose(x, (1, 2, 0))
+
+
+def plot_feature_maps_cnn(enc: nn.Module, x: torch.Tensor, n_maps: int = 8, title: str = "Feature Maps") -> go.Figure:
+    # capture last Conv2d activations
+    target_conv = None
+    for m in reversed(list(enc.features.modules())):
+        if isinstance(m, nn.Conv2d):
+            target_conv = m
+            break
+    assert target_conv is not None, "No Conv2d layer found in encoder.features"
+
+    acts = {}
+    def fwd_hook(module, inp, out):
+        acts['feat'] = out.detach()
+    h = target_conv.register_forward_hook(fwd_hook)
+    was_training = enc.training
+    enc.eval()
+    with torch.no_grad():
+        _ = enc(x.to(DEVICE)) # run forward pass
+    if was_training:
+        enc.train()
+    h.remove()
+
+    feat = acts['feat'][0]  # [C,H,W]
+    c = min(n_maps, feat.size(0))
+    maps = feat[:c]
+    # per-map minmax
+    maps = (maps - maps.amin(dim=(1,2), keepdim=True)) / (maps.amax(dim=(1,2), keepdim=True) - maps.amin(dim=(1,2), keepdim=True) + 1e-6)
+
+    rows = int(np.ceil(c / 4))
+    cols = min(4, c)
+    fig = make_subplots(rows=rows, cols=cols, subplot_titles=[f"ch {i}" for i in range(c)], vertical_spacing=0.08)
+    r = c
+    for i in range(c):
+        rr = i // cols + 1
+        cc = i % cols + 1
+        z = maps[i].detach().cpu().numpy()
+        fig.add_trace(go.Heatmap(z=z, colorscale='Inferno', showscale=False), row=rr, col=cc)
+    for i in range(rows*cols):
+        rr = i // cols + 1
+        cc = i % cols + 1
+        fig.update_xaxes(visible=False, row=rr, col=cc)
+        fig.update_yaxes(visible=False, row=rr, col=cc)
+    fig.update_layout(height=max(400, rows*220), width=900, title=title, showlegend=False)
+    return fig
+
+
+def plot_gradcam_cnn(enc: nn.Module, clf: nn.Module, x: torch.Tensor, target_class: int = None, alpha: float = 0.45, title: str = "Grad-CAM") -> go.Figure:
+    # find last conv
+    target_conv = None
+    for m in reversed(list(enc.features.modules())):
+        if isinstance(m, nn.Conv2d):
+            target_conv = m
+            break
+    assert target_conv is not None, "No Conv2d layer found in encoder.features"
+
+    feats, grads = {}, {}
+    def fwd_hook(module, inp, out):
+        feats['v'] = out
+    def bwd_hook(module, gin, gout):
+        grads['v'] = gout[0]
+    h1 = target_conv.register_forward_hook(fwd_hook)
+    h2 = target_conv.register_full_backward_hook(bwd_hook)
+
+    model = nn.Sequential(enc, clf).to(DEVICE)
+    model.eval()
+
+    x = x.to(DEVICE).requires_grad_(True)
+    logits = model(x)
+    if target_class is None:
+        target_class = int(logits.argmax(dim=1).item())
+    model.zero_grad()
+    logits[0, target_class].backward()
+
+    A = feats['v'][0]       # [C,H,W]
+    dA = grads['v'][0]      # [C,H,W]
+    w = dA.mean(dim=(1,2))  # [C]
+    cam = (w[:, None, None] * A).sum(dim=0)
+    cam = torch.relu(cam)
+    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-6)
+    cam = torch.nn.functional.interpolate(cam[None, None], size=(IMAGE_SIZE, IMAGE_SIZE), mode='bilinear', align_corners=False)[0,0]
+
+    img_rgb = _to_uint8_rgb(x[0].detach())
+
+    h1.remove(); h2.remove()
+
+    fig = make_subplots(rows=1, cols=1)
+    fig.add_trace(go.Image(z=img_rgb))
+    fig.add_trace(go.Heatmap(z=cam.detach().cpu().numpy(), colorscale='Jet', opacity=alpha, showscale=False))
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+    fig.update_layout(height=420, width=420, title=title)
+    return fig
+
+
+def plot_saliency(model: nn.Module, x: torch.Tensor, target_class: int = None, alpha: float = 0.45, title: str = "Saliency") -> go.Figure:
+    model = model.to(DEVICE)
+    model.eval()
+
+    x = x.to(DEVICE).requires_grad_(True)
+    logits = model(x)
+    if target_class is None:
+        target_class = int(logits.argmax(dim=1).item())
+    model.zero_grad()
+    logits[0, target_class].backward()
+
+    g = x.grad.detach()[0]  # [3,H,W]
+    sal = g.abs().amax(dim=0)  # [H,W]
+    sal = (sal - sal.min()) / (sal.max() - sal.min() + 1e-6)
+
+    img_rgb = _to_uint8_rgb(x[0].detach())
+
+    fig = make_subplots(rows=1, cols=1)
+    fig.add_trace(go.Image(z=img_rgb))
+    fig.add_trace(go.Heatmap(z=sal.cpu().numpy(), colorscale='Viridis', opacity=alpha, showscale=False))
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+    fig.update_layout(height=420, width=420, title=title)
+    return fig
+
+
+def plot_vit_attention(vit: nn.Module, model: nn.Module, x: torch.Tensor, layer: int = -1, alpha: float = 0.5, title: str = "ViT CLS Attention") -> go.Figure:
+    # capture attention weights from a given TransformerBlock.attention
+    attn_store = []
+    layers = vit.transformer_layers
+    idx = layer if layer >= 0 else (len(layers) + layer)
+    idx = max(0, min(idx, len(layers)-1))
+    blk = layers[idx]
+
+    def attn_hook(module, inp, out):
+        # out = (attn_output, attn_weights)
+        attn_store.append(out[1].detach())
+    h = blk.attention.register_forward_hook(attn_hook)
+
+    model = model.to(DEVICE)
+    model.eval()
+    with torch.no_grad():
+        _ = model(x.to(DEVICE))
+    h.remove()
+
+    assert len(attn_store) > 0, "No attention captured; ensure forward ran."
+    A = attn_store[0][0]  # [T,T] after averaging heads
+    cls_to_all = A[0]     # [T]
+    patch_scores = cls_to_all[1:]  # ignore CLS self-attn
+    grid = int(np.sqrt(vit.num_patches))
+    attn_map = patch_scores[:grid*grid].reshape(grid, grid)
+    attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-6)
+    attn_up = torch.nn.functional.interpolate(attn_map[None,None], size=(IMAGE_SIZE, IMAGE_SIZE), mode='bilinear', align_corners=False)[0,0]
+
+    img_rgb = _to_uint8_rgb(x[0].detach())
+
+    fig = make_subplots(rows=1, cols=1)
+    fig.add_trace(go.Image(z=img_rgb))
+    fig.add_trace(go.Heatmap(z=attn_up.cpu().numpy(), colorscale='Viridis', opacity=alpha, showscale=False))
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+    fig.update_layout(height=420, width=420, title=title)
+    return fig
+
+
+def run_sweep(experiment_name: str = None, project_name: str = None):
+    """Run Optuna sweep with ClearML logging. Set experiment base name via param."""
+    global SWEEP_EXPERIMENT_BASE, CLEARML_PROJECT
+    if experiment_name:
+        SWEEP_EXPERIMENT_BASE = experiment_name
+    if project_name:
+        CLEARML_PROJECT = project_name
     study_name = os.environ.get('STUDY', 'tiny_imagenet_sweep')
     storage = RDBStorage(
         url=f"sqlite:///{os.path.abspath('sweep.db')}",
-        engine_kwargs={"connect_args": {"timeout": 60}},  # wait up to 60s on busy DB
+        engine_kwargs={"connect_args": {"timeout": 60}},
     )
     study = optuna.create_study(direction='maximize', study_name=study_name, storage=storage, load_if_exists=True)
     n_trials = int(os.environ.get('N_TRIALS', '10'))
     study.optimize(objective, n_trials=n_trials, n_jobs=1)
+
+
+def run_fixed(experiment_name: str = None, project_name: str = None):
+    # ClearML Task for fixed training
+    exp_name = experiment_name or FIXED_EXPERIMENT_NAME
+    proj_name = project_name or CLEARML_PROJECT
+    task = Task.init(project_name=proj_name, task_name=exp_name, reuse_last_task_id=False)
+    logger = task.get_logger()
+    task.connect(HPARAMS, name='HPARAMS')
+
+    # data & loaders
+    train_data = get_dataset('train')
+    val_data = get_dataset('valid')
+    train_loader = DataLoader(train_data, batch_size=HPARAMS['batch_size'], shuffle=True,
+                              num_workers=4, pin_memory=(DEVICE.type=='cuda'))
+    val_loader = DataLoader(val_data, batch_size=HPARAMS['batch_size'], shuffle=False,
+                            num_workers=4, pin_memory=(DEVICE.type=='cuda'))
+
+    # model
+    enc = encoder(HPARAMS['encoder'], conv_depth=HPARAMS.get('conv_depth', 4), residual=HPARAMS.get('residual', False))
+    clf = classifier_head(head_depth=HPARAMS.get('head_depth', 2))
+    model = nn.Sequential(enc, clf).to(DEVICE)
+
+    # resume from checkpoint if available (minimalistic)
+    ckpt_path = os.path.join('checkpoints', 'best_fixed.pt')
+    if os.path.isfile(ckpt_path):
+        try:
+            state = torch.load(ckpt_path, map_location=DEVICE)
+            sd = state['state_dict'] if isinstance(state, dict) and 'state_dict' in state else state
+            model.load_state_dict(sd, strict=False)
+            print(f"Resumed weights from {ckpt_path}")
+        except Exception as e:
+            print(f"Could not load checkpoint {ckpt_path}: {e}")
+
+    # optim & loss
+    optimizer = torch.optim.Adam(model.parameters(), lr=HPARAMS['learning_rate'], weight_decay=HPARAMS['weight_decay'])
+    criterion = nn.CrossEntropyLoss(label_smoothing=HPARAMS['label_smoothing'])
+
+    # train
+    print("Training with fixed hyperparameters:", HPARAMS)
+    best = train(model, train_loader, val_loader, optimizer, criterion, logger=logger, checkpoint_path=os.path.join('checkpoints', 'best_fixed.pt'))
+    logger.report_scalar("best_val_acc", "final", best, iteration=0)
+    print(f"Best val acc: {best:.4f}. Checkpoint saved on improvement at checkpoints/best_fixed.pt")
+
+    # sample one batch and visualize
+    xb, yb = next(iter(val_loader))
+    xb = xb[:1]  # one sample
+
+    if HPARAMS['encoder'] == 'conv':
+        # Feature maps
+        fig_fm = plot_feature_maps_cnn(enc, xb, n_maps=8, title="CNN Feature Maps")
+        fig_fm.show()
+        # Grad-CAM
+        fig_cam = plot_gradcam_cnn(enc, clf, xb, target_class=None, alpha=0.45, title="CNN Grad-CAM")
+        fig_cam.show()
+        # Saliency
+        fig_sal = plot_saliency(model, xb, target_class=None, alpha=0.45, title="CNN Saliency")
+        fig_sal.show()
+    else:
+        # ViT attention + general saliency (optional)
+        fig_attn = plot_vit_attention(enc, model, xb, layer=-1, alpha=0.5, title="ViT Attention (CLS→patches)")
+        fig_attn.show()
+        fig_sal = plot_saliency(model, xb, target_class=None, alpha=0.45, title="ViT Saliency")
+        fig_sal.show()
+
+    task.flush()
+    task.close()
+
+
+if __name__ == '__main__':
+    # run_sweep()
+    run_fixed()
